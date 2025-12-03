@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-class WorldModel(nn.Module):
+class RewardModel(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
         """
         A simple 2-layer Feedforward Neural Network (MLP).

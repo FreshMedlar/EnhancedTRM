@@ -1,3 +1,4 @@
+from typing_extensions import override
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -46,6 +47,7 @@ class ModernHopfieldNetwork(nn.Module):
         activations = self.beta * (state @ self.stored_patterns.T)
         return -(1.0 / self.beta) * torch.logsumexp(activations, dim=1)
 
+    @override
     def forward(self, state: torch.Tensor, num_updates: int = 1) -> torch.Tensor:
         """
         Retrieves memory by updating the state to minimize energy.
@@ -95,7 +97,7 @@ def run_demo():
     torch.manual_seed(42)
     clean_patterns = torch.randn(n_patterns, dim)
     clean_patterns = F.normalize(clean_patterns, p=2, dim=1)
-   11 
+    
     # 2. One-Shot Learning
     # The model memorizes these instantly without backprop
     model.one_shot_learn(clean_patterns)
@@ -108,7 +110,7 @@ def run_demo():
     corrupted_input = F.normalize(corrupted_input, p=2, dim=1)
     
     # 4. Retrieve
-    recovered_pattern = model(corrupted_input, num_updates=1)
+    recovered_pattern = model(corrupted_input, num_updates=100)
     
     # 5. Verify Similarity (Cosine Similarity)
     # Cosine similarity between recovered and original target
