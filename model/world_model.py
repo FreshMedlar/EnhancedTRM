@@ -4,16 +4,17 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 class WorldModel(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+    def __init__(self,obs_dim, act_dim, hidden_dim: int, output_dim: int):
         """
         A simple 2-layer Feedforward Neural Network (MLP).
         Structure: Input -> Linear -> ReLU -> Linear -> Output
         """
         super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc1 = nn.Linear(obs_dim + act_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, output_dim)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, obs, act) -> torch.Tensor:
+        x = torch.cat([obs, act], dim=-1)
         x = self.fc1(x)
         x = F.relu(x)
         x = self.fc2(x) 
