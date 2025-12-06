@@ -148,29 +148,8 @@ for episode in range(num_episodes):
         # action selection
         action, log_prob = select_action(obs)
         action_t = torch.tensor([action.item()], dtype=torch.float32, device=device).unsqueeze(1)
-
-        # Train World Model
-        # input: world model, action
-        # output: future world model
-        # how do we make this model check at different points in the future? we pass a variable along to signal when? how does it learn then?
-        # this model learns by checking if predictions are corrects (HOW? delayed proof of correctness)       w_optimizer.zero_grad()
         pred_next_obs = world_model(obs_t, action_t)
-
-        # Train Reward Model
-        # input: world_model(), objective() 
-        # output: reward ()
-        # This reward model simply judges an hypotetical world model, and use it to decide what to do next. It probably needs to recurrently check
-        # learn by checking the reward of the current world model paired with the objective
         pred_rewards = reward_model(pred_next_obs.detach()).view(-1)
-
-        # Train Action Model 
-        # input: world model, objective
-        # output: action
-        # this model gives an hypotetical action
-        # again this learning suffers from delayed rewards. What could give a loss to learn? the outcome can be theorized and loss can be estimated
-        # eat candy -> fat (here we use world model to infer future) 
-        # fat -> bad (high loss) (here we use reward model to infer loss)
-        # the cycle could be action - world - reward
         a_optimizer.zero_grad()
         action_loss = -log_prob * pred_rewards.detach()
         action_loss.backward()
