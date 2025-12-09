@@ -8,6 +8,102 @@ from torch.distributions import Categorical
 import gymnasium as gym
 import copy
 
+
+#
+# TinyRecursiveModel
+#
+
+class TinyRecursiveModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_loops=16):
+        """
+        Args:
+            input_dim: Dimension of the problem input (x)
+            hidden_dim: Dimension of the latent scratchpad (z)
+            output_dim: Dimension of the answer (y)
+            num_loops: How many times to recurse (think) before outputting
+        """
+        super().__init__()
+        self.num_loops = num_loops
+        self.hidden_dim = hidden_dim
+        
+        # --- Embeddings ---
+        # Projects input x and current answer y into the latent space size
+        self.x_proj = nn.Linear(input_dim, hidden_dim)
+        self.y_proj = nn.Linear(output_dim, hidden_dim)
+        
+        # --- The "Tiny" Network ---
+        # A simple MLP that will be reused recursively.
+        # It takes concatenated (x, y, z) and outputs updates for z.
+        self.think_net = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim * 4),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 4, hidden_dim)
+        )
+        
+        # --- The Output Head ---
+        # Converts the final latent state z back into an answer y
+        self.act_net = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x, initial_y=None):
+        batch_size = x.size(0)
+        
+        # 1. Initialize States
+        # x_emb: Fixed representation of the problem
+        x_emb = self.x_proj(x) 
+        
+        # z: The "Scratchpad" (Latent thought vector), initialized to zeros
+        z = torch.zeros(batch_size, self.hidden_dim, device=x.device)
+        
+        # y: The "Current Answer", initialized to zeros or a start token
+        if initial_y is None:
+            # Assuming continuous output for simplicity; for tokens use embeddings
+            y = torch.zeros(batch_size, self.act_net.out_features, device=x.device)
+        else:
+            y = initial_y
+
+        # 2. Recursive Reasoning Loop (The "Think" Phase)
+        # We reuse the SAME small network multiple times.
+        for step in range(self.num_loops):
+            # Project current y into hidden space
+            y_emb = self.y_proj(y)
+            
+            # Combine distinct streams: 
+            # Problem (x) + Current Guess (y) + Current Thoughts (z)
+            combined_input = torch.cat([x_emb, y_emb, z], dim=-1)
+            
+            # Update thoughts (z) based on the combined state
+            # This is a residual update (z_new = z_old + update)
+            z_update = self.think_net(combined_input)
+            z = z + z_update  
+            
+            # 3. Refinement (The "Act" Phase)
+            # Update the answer y based on the new thoughts
+            # In the official paper, this might happen less frequently or at every step
+            y = self.act_net(z)
+
+        return y
+
+# --- Example Usage ---
+if __name__ == "__main__":
+    # Hyperparameters
+    BATCH_SIZE = 5
+    INPUT_DIM = 64   # Size of the puzzle/problem embedding
+    HIDDEN_DIM = 128 # Size of the "brain" (scratchpad)
+    OUTPUT_DIM = 10  # Size of the solution
+    
+    # Instantiate the model
+    model = TinyRecursiveModel(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM, num_loops=12)
+    
+    # Dummy data (e.g., a batch of 5 logic puzzles)
+    x = torch.randn(BATCH_SIZE, INPUT_DIM)
+    
+    # Forward pass (Thinking process...)
+    final_answer = model(x)
+    
+    print(f"Input shape: {x.shape}")
+    print(f"Output shape: {final_answer.shape}")
+    print("Model successfully reasoned recursively!")
+
 # -------------------------------------------------------------
 # 1. LEARNING MODEL
 # -------------------------------------------------------------
@@ -315,7 +411,7 @@ def train_policy_in_imagination(world_model, distance_critic, action_model, a_op
         goal_batch = goal.repeat(state.shape[0], 1)
     else:
         goal_batch = goal
-
+    
     for t in range(horizon):
         logits = action_model(state, goal_batch)
         
@@ -364,6 +460,7 @@ def train_model():
     g_global = torch.tensor(goal_state, dtype=torch.float32, device=device).unsqueeze(0)
     
     # Create models
+    world_model = TinyRecursiveModel(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM, num_loops=12)
     world_model = WorldModel(obs_dims, act_dims, 128, 128, obs_dims).to(device)
     action_model = ActionModel(obs_dims, 128, 128, act_dims).to(device)
     distance_critic = DistanceCritic(obs_dims, 128, 128, 1).to(device)
@@ -444,6 +541,7 @@ def train_model():
     
                 # --- Train World Model ---
                 b_act_onehot = F.one_hot(b_act_idx, num_classes=act_dims).float()
+                pred_next = world_model()
                 pred_next = world_model(b_obs, b_act_onehot)
                 world_loss = mse_criterion(pred_next, b_next)
                 
