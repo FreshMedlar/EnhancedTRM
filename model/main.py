@@ -1,8 +1,3 @@
-from reward_model import RewardModel
-from world_model import WorldModel
-from memory import ModernHopfieldNetwork
-from action_model import ActionModel
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -11,6 +6,17 @@ import torch.optim as optim
 from torch.distributions import Categorical
 
 import gymnasium as gym
+
+#
+#
+# MODELS
+#
+#
+
+class WorldModel():
+     
+
+
 
 # Setup environment and device
 device = torch.device("cpu") # Forcing CPU for this environment
