@@ -1,16 +1,7 @@
 
 reinforcement learning
-- [x] create base model
+- [ ] create base model (the base model will be a world)
 - [ ] set right input/output dimensions for all models
 - [ ] next
-- [ ] jsalfd
-- [ ] jsalfd
-- [ ] jsalfd
-- [ ] jsalfd
-- [ ] jsalfd
-- [ ] jsalfd
-- [ ] jsalfd
-- [ ] jsalfd
-- [ ] jsalfd
 - [ ] jsalfd
 
