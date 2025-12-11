@@ -13,7 +13,6 @@ import gymnasium as gym
 #
 #
 
-class WorldModel():
      
 
 
