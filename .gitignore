@@ -1,4 +1,8 @@
 .python-version
+.wandb/
+.model/wandb/
+*.pth
+.model/*.pth
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
