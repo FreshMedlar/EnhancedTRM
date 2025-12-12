@@ -7,6 +7,8 @@ import torch.optim as optim
 from torch.distributions import Categorical
 import gymnasium as gym
 import copy
+from PIL import Image
+from collections import deque
 
 #
 #
@@ -28,40 +30,141 @@ entropy_coef  = 0.01        # New: Encourages exploration
 
 device = torch.device("cpu")
 
+# -------------------------------------------------------------
+# WRAPPERS for Visual Observations
+# -------------------------------------------------------------
+class VisualWrapper(gym.Wrapper):
+    def __init__(self, env, shape=(84, 84)):
+        super().__init__(env)
+        self.shape = shape
+        self.observation_space = gym.spaces.Box(
+            low=0.0, high=1.0, 
+            shape=(1, shape[0], shape[1]), 
+            dtype=np.float32
+        )
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        # Return a black frame on reset to avoid potential render-on-reset crashes
+        process_obs = np.zeros((1, self.shape[0], self.shape[1]), dtype=np.float32) 
+        return process_obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return self._process_obs(obs), reward, terminated, truncated, info
+        
+    def _process_obs(self, obs_vector):
+        try:
+            # print("Calling render...")
+            frame = self.env.render() 
+            # print(f"Render returned {type(frame)}")
+            if frame is None:
+                print("Error: env.render() returned None")
+                return np.zeros((1, self.shape[0], self.shape[1]), dtype=np.float32)
+
+            # print("Resizing...")
+            img = Image.fromarray(frame)
+            img = img.resize(self.shape, Image.BILINEAR)
+            img = img.convert("L") # Grayscale
+            
+            obs = np.array(img, dtype=np.float32) / 255.0
+            obs = np.expand_dims(obs, axis=0) # (1, 84, 84)
+            return obs
+        except Exception as e:
+            print(f"Error in _process_obs: {e}")
+            raise e
+
+class StackFrames(gym.Wrapper):
+    def __init__(self, env, k=4):
+        super().__init__(env)
+        self.k = k
+        self.frames = deque([], maxlen=k)
+        shp = env.observation_space.shape
+        self.observation_space = gym.spaces.Box(
+            low=0.0, high=1.0,
+            shape=(k * shp[0], shp[1], shp[2]), # (k*C, H, W) -> (4, 84, 84)
+            dtype=np.float32
+        )
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        for _ in range(self.k):
+            self.frames.append(obs)
+        return self._get_obs(), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self.frames.append(obs)
+        return self._get_obs(), reward, terminated, truncated, info
+
+    def _get_obs(self):
+        return np.concatenate(list(self.frames), axis=0)
+
+# -------------------------------------------------------------
+# PPO MODEL
+# -------------------------------------------------------------
+
+class CNNExtractor(nn.Module):
+    def __init__(self, input_shape):
+        super(CNNExtractor, self).__init__()
+        # input_shape is (C, H, W) e.g. (4, 84, 84)
+        c, h, w = input_shape
+        
+        self.net = nn.Sequential(
+            nn.Conv2d(c, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten()
+        )
+        
+        # Compute output size
+        with torch.no_grad():
+            dummy = torch.zeros(1, c, h, w)
+            out = self.net(dummy)
+            self.out_dim = out.shape[1]
+
+    def forward(self, x):
+        return self.net(x)
+
 class PPO(nn.Module):
-    def __init__(self, obs_dim, act_dim):
+    def __init__(self, obs_shape, act_dim):
         super(PPO, self).__init__()
         self.data = []
         
+        # Feature Extractors
+        # We can share parameters or have separate ones. 
+        # For simplicity and classic PPO style, let's keep them separate but same architecture.
+        # Although sharing is very common for CNNs. Let's do separate for stability first.
+        self.actor_cnn = CNNExtractor(obs_shape)
+        self.critic_cnn = CNNExtractor(obs_shape)
+        
         # 1. ACTOR
-        self.actor = nn.Sequential(
-            nn.Linear(obs_dim, 128),  # Increased width for better feature extraction
-            nn.Tanh(),
-            nn.Linear(128, 128),
-            nn.Tanh(),
-            nn.Linear(128, act_dim),
+        self.actor_head = nn.Sequential(
+            nn.Linear(self.actor_cnn.out_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, act_dim),
             nn.Softmax(dim=-1)
         )
         
         # 2. CRITIC
-        self.critic = nn.Sequential(
-            nn.Linear(obs_dim, 128),
-            nn.Tanh(),
-            nn.Linear(128, 128),
-            nn.Tanh(),
-            nn.Linear(128, 1)
+        self.critic_head = nn.Sequential(
+            nn.Linear(self.critic_cnn.out_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1)
         )
         
-        # 3. Orthogonal Initialization (Crucial for PPO stability)
-        self._init_weights()
-
         self.optimizer = optim.Adam(self.parameters(), lr=learning_rate)
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, np.sqrt(2))
-                nn.init.constant_(m.bias, 0.0)
+    def actor(self, x):
+        features = self.actor_cnn(x)
+        return self.actor_head(features)
+        
+    def critic(self, x):
+        features = self.critic_cnn(x)
+        return self.critic_head(features)
 
     def put_data(self, transition):
         self.data.append(transition)
@@ -70,6 +173,7 @@ class PPO(nn.Module):
         s_lst, a_lst, r_lst, s_prime_lst, prob_a_lst, done_lst = [], [], [], [], [], []
         for transition in self.data:
             s, a, r, s_prime, prob_a, done = transition
+            
             s_lst.append(s)
             a_lst.append([a])
             r_lst.append([r])
@@ -79,6 +183,7 @@ class PPO(nn.Module):
             done_lst.append([done_mask])
             
         # Convert to tensors
+        # Observations are numpy arrays already
         s = torch.tensor(np.array(s_lst), dtype=torch.float).to(device)
         a = torch.tensor(np.array(a_lst)).to(device)
         r = torch.tensor(np.array(r_lst), dtype=torch.float).to(device)
@@ -88,6 +193,7 @@ class PPO(nn.Module):
         
         self.data = []
         return s, a, r, s_prime, done_mask, prob_a
+
 
     def train_net(self):
         s, a, r, s_prime, done_mask, prob_a = self.make_batch()
@@ -160,11 +266,19 @@ class PPO(nn.Module):
 
                 self.optimizer.zero_grad()
                 loss.mean().backward()
+                nn.utils.clip_grad_norm_(self.parameters(), 0.5) # Gradient Clipping
                 self.optimizer.step()
 
 def train_teacher_model(env_string, continue_training=True):
-    env = gym.make(env_string)
-    model = PPO(env.observation_space.shape[0], env.action_space.n).to(device)
+    # Initialize with RGB Render Mode
+    print("Creating environment...")
+    env = gym.make(env_string, render_mode="rgb_array")
+    print("Environment created.")
+    env = VisualWrapper(env)
+    env = StackFrames(env)
+    
+    # Input shape is (4, 84, 84)
+    model = PPO(env.observation_space.shape, env.action_space.n).to(device)
     
     model_path = "ppo_best_teacher.pth"
     
@@ -177,26 +291,33 @@ def train_teacher_model(env_string, continue_training=True):
 
 
     score = 0.0
-    print_interval = 20
+    print_interval = 1
     
     # Track best score to save the absolute best model
     best_avg_score = -999 
 
     for n_epi in range(10000): # Increased max episodes just in case
-        s, _ = env.reset()
+        print(f"Starting episode {n_epi}")
+        try:
+            s, _ = env.reset()
+        except Exception as e:
+            print(f"CRASH in env.reset(): {e}")
+            break
         done = False
         
         while not done:
             # Get action (no gradients needed during sampling)
             with torch.no_grad():
-                prob = model.actor(torch.from_numpy(s).float().to(device))
+                # Add batch dimension: (1, 4, 84, 84)
+                s_tensor = torch.from_numpy(s).float().unsqueeze(0).to(device)
+                prob = model.actor(s_tensor)
                 m = Categorical(prob)
                 a = m.sample().item()
 
             s_prime, r, terminated, truncated, info = env.step(a)
             done = terminated or truncated
 
-            model.put_data((s, a, r/100.0, s_prime, prob[a].item(), done))
+            model.put_data((s, a, r/100.0, s_prime, prob[0][a].item(), done))
             s = s_prime
             score += r
 
@@ -241,8 +362,12 @@ def train_model():
     # -------------------------------------------------------------
     env_string = "LunarLander-v3"
     device = torch.device("cpu")
-    env = gym.make(env_string)
-    obs_dims = env.observation_space.shape[0]
+    env = gym.make(env_string, render_mode="rgb_array")
+    # Wrap locally just to get sizes if needed
+    env = VisualWrapper(env)
+    env = StackFrames(env)
+    
+    obs_dims = env.observation_space.shape # (4, 84, 84)
     act_dims = env.action_space.n
     
     # Define fixed goal state

@@ -1,11 +1,7 @@
 
 reinforcement learning
 - [x] train a teacher model
-- [ ] train a teacher model that uses vision
+- [ ] train a teacher model that uses vision (this is difficult)
 - [ ] create a base dreamer model
-- [ ] make sure the base dreamer model works
-- [ ] use trm to learn the world model
-- [ ] let the world model learn from watching a teacher model
-- [ ] test the now learned model without a teacher model
-- [ ] modify dreamer to generalize in other scenarios without scenario pre-training
-
+- [x] use trm to learn the world model (action conditioning works better)
+- [ ] create a model based rl algo that uses the trm world model
