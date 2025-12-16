@@ -187,7 +187,6 @@ def test():
     current_seq = preprocess(obs).to(device)
     
 
-
 if __name__ == "__main__":
     # test()
     train_world_model()
