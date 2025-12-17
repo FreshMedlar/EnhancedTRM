@@ -40,6 +40,175 @@ def preprocess(obs):
     # Add batch dim -> (1, 1024)
     return torch.tensor(arr, dtype=torch.long).unsqueeze(0)
 
+class Selector(nn.Module):
+    def __init__(self, latent_dim=256, k=16, patch_size=4, img_size=32):
+        super().__init__()
+        self.k = k
+        self.patch_size = patch_size
+        self.num_patches = (img_size // patch_size) ** 2
+        self.patch_dim = latent_dim # CNN outputs latent_dim channels
+
+        # CNN: Extract features for each patch
+        # Input: (B, 1, 32, 32)
+        # We want to maintain spatial structure to define patches.
+        # Let's use a simple CNN that outputs (B, Dim, 8, 8) for 4x4 patches (32/4=8)
+        self.cnn = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, latent_dim, kernel_size=3, padding=1), # (B, Dim, 32, 32)
+            nn.MaxPool2d(kernel_size=patch_size, stride=patch_size) # (B, Dim, 8, 8)
+        )
+        
+        # RNN to score patches
+        # Input to RNN: Sequence of patches (B, NumPatches, LatentDim)
+        self.rnn = nn.GRU(input_size=latent_dim, hidden_size=128, batch_first=True)
+        self.scorer = nn.Linear(128, 1) # Output score for each patch
+
+        # Attention Block
+        self.attn = nn.MultiheadAttention(embed_dim=latent_dim, num_heads=4, batch_first=True)
+        
+    def forward(self, x):
+        """
+        x: (B, 1024) Observation
+        Returns: (B, K, LatentDim) Selected patches processed
+        """
+        B = x.shape[0]
+        # Reshape to image
+        x = x.view(B, 1, 32, 32).float() / 255.0
+        
+        # 1. CNN Feature Extraction
+        # (B, LatentDim, 8, 8)
+        features = self.cnn(x)
+        
+        # Flatten spatial dims to sequence of patches
+        # (B, LatentDim, 64) -> (B, 64, LatentDim)
+        patches = features.flatten(2).transpose(1, 2)
+        
+        # 2. RNN Scoring
+        # rnn_out: (B, 64, Hidden)
+        rnn_out, _ = self.rnn(patches) 
+        # scores: (B, 64, 1) -> (B, 64)
+        scores = self.scorer(rnn_out).squeeze(-1)
+        
+        # 3. Top-K Selection with Straight-Through Estimator
+        # Forward pass: Pick Top K
+        # We want a binary mask M where M[i] = 1 if i in TopK else 0
+        
+        # Get TopK indices
+        # topk_indices: (B, K)
+        _, topk_indices = torch.topk(scores, self.k, dim=1)
+        
+        # Create mask
+        mask = torch.zeros_like(scores)
+        mask.scatter_(1, topk_indices, 1.0)
+        
+        # Straight-Through Estimator
+        # Forward: use mask (binary)
+        # Backward: treat mask as equal to scores (or sigmoid of scores, but here we just pass gradients through)
+        # A common simple STE for selection is:
+        # y = hard + (soft - soft.detach())
+        # Here we don't have a perfect "soft" equivalent that sums to K easily without softmax temp annealing.
+        # But we can just say: mask_ste = mask - scores.detach() + scores
+        # This way d(mask_ste)/d(scores) = 1.
+        mask_ste = mask - scores.detach() + scores
+        
+        # We need to select the patches. 
+        # We can't just multiply by mask because we want to reduce the sequence length to K.
+        # But for the gradient to flow back to 'scores' through 'mask_ste', 'mask_ste' must be used in the computation.
+        
+        # Standard Index Select (No Gradient to indices usually)
+        # But we want gradient to 'scores' that determined the indices.
+        # The standard "Hard Attention" or "ST Gumbel Softmax" approach uses the weighted sum 
+        # but forces weights to be one-hot (or k-hot).
+        
+        # Let's try: Weighted sum where weights are mask_ste (0 or 1 effectively).
+        # This keeps shape (B, 64, Dim). To get (B, K, Dim), we usually just index.
+        # If we index typically, we lose gradients w.r.t selection likelihood unless we use REINFORCE.
+        # THE USER wants "Straight-Through Estimator".
+        # "You take the RNN's scores, pick the top K patches (1s) and discard the rest (0s).
+        # Backward Pass: You cheat. You tell the computer to ignore the 0/1 selection and act 
+        # as if the "heavy model" was directly connected to the RNN's scores."
+        
+        # Interpretation:
+        # We want the downstream model to receive the selected patches.
+        # If we just Pass selected patches, we essentially have:
+        # Output = Patches[Indices]
+        # The Indices came from Scores.
+        # Operations:
+        # 1. Softmax/Sigmoid Scores -> Weights
+        # 2. Hard selection (TopK) -> Mask
+        # 3. y = Mask * Patches  (Shape B, N, D) -> Then gather?
+        # If we implement literally "act as if heavy model was directly connected to RNN's scores":
+        # Maybe we weight the selected patches by the score?
+        # Or better: passed_patches = selected_patches * score_of_selected_patch / score_of_selected_patch.detach()
+        # This scales by 1.0 but attaches the gradient.
+        
+        # Let's do this:
+        # Gather the scores for the top k
+        topk_scores = torch.gather(scores, 1, topk_indices) # (B, K)
+        # Re-attach gradient:
+        # We want dL/dScore to be active.
+        # We can multiply features by (score / score.detach()) NO, that's 1.
+        # We effectively want "Mask" to have gradient 1 w.r.t Score.
+        # mask_ste has gradient 1 w.r.t. Score.
+        # output = patches * mask_ste.unsqueeze(-1)  -> This is (B, 64, Dim) with masked out zeros.
+        # Then we select the non-zeros.
+        
+        # But Tensor extraction (indexing) is not differentiable w.r.t indices.
+        # However, if we do:
+        # valid_patches = patches * mask_ste.unsqueeze(-1)
+        # selected = [extract non-zeros]
+        # The extraction isn't diff, but the VALUES are scaled by mask_ste (approx 1 or 0 + grad).
+        
+        # Simpler approach often used in Vision Transformers (e.g. Dynamic ViT):
+        # Keep all patches but zero out the dropped ones?
+        # User said: "pick the top K patches (1s) and discard the rest (0s)."
+        # "this patches will pass through an attention block". Sequence length usually matters for efficiency.
+        # If we just zero them out, self-attention still is N^2 (unless masked).
+        # But the User implies "efficiency of 0/1 selection". So we should actually reduce K.
+        
+        # Implementation:
+        # 1. Identify indices.
+        # 2. Gather patches: selected_patches = torch.gather(patches, 1, topk_indices.unsqueeze(-1).expand(-1, -1, LatentDim))
+        # 3. Gather scores: selected_scores = torch.gather(scores, 1, topk_indices)
+        # 4. Multiply: selected_patches = selected_patches * (selected_scores / selected_scores.detach()).unsqueeze(-1)
+        # This way, the content of the selected patch is multiplied by 1.0, 
+        # but the gradient flows to 'selected_scores', which flows to 'scores'.
+        # This seems to match the "cheat" logic.
+        
+        # However, there's a risk: if Score < 0, this flips sign. 
+        # Maybe sigmoid the scores first? or 1 + score - score.detach()
+        # Let's use the additive STE:
+        # proxy = selected_scores - selected_scores.detach() + 1.0
+        # selected_patches = selected_patches * proxy.unsqueeze(-1)
+        
+        selected_patches = torch.gather(patches, 1, topk_indices.unsqueeze(-1).expand(-1, -1, self.patch_dim)) # (B, K, Dim) (Note: reusing latent_dim for convenience, but actually patch_dim might be different if not projected, but here cnn outputs latent_dim)
+        selected_scores = torch.gather(scores, 1, topk_indices) # (B, K)
+        
+        # STE
+        # We want the selection to be sensitive to the score.
+        # If score goes up, we want to encourage efficient selection?
+        # Actually, standard STE on binary mask usually works on the mask generation step.
+        # Since we are essentially doing "Hard Attention", let's follow the standard:
+        # y = y_hard - y_soft.detach() + y_soft
+        # Here we don't have y_soft easily for the gathered tensor.
+        # Let's try the multiplicative trick which represents "how much this patch contributes".
+        # If we want the network to learn WHICH to pick, the gradient must say "if this had a higher score, loss would decrease".
+        # The multiplicative term `selected_patches * selected_scores` provides a gradient to scores.
+        
+        # User said: "act as if the "heavy model" was directly connected to the RNN's scores."
+        # If I multiply by score, the heavy model sees `patch * score`.
+        # If I multiply by `(1 + score - score.detach())`, the heavy model sees `patch` (approximated) but gradients flow to score.
+        
+        proxy = selected_scores - selected_scores.detach() + 1.0
+        selected_patches = selected_patches * proxy.unsqueeze(-1)
+        
+        # 4. Attention Block
+        # Input (B, K, Dim)
+        attn_out, _ = self.attn(selected_patches, selected_patches, selected_patches)
+        
+        return attn_out
+
 class RewardModel(nn.Module):
     def __init__(self, latent_dim):
         super().__init__()
@@ -435,6 +604,24 @@ def test():
     print("Testing MBRL Agent...")
     env = gym.make('ALE/Breakout-v5', render_mode='rgb_array')
     agent = MBRLAgent()
+    
+    # Test Selector
+    print("Testing Selector...")
+    selector = Selector(latent_dim=256, k=16).to(DEVICE)
+    dummy_obs = torch.randint(0, 255, (2, 1024)).to(DEVICE) # Batch 2
+    
+    # Forward
+    out = selector(dummy_obs)
+    print(f"Selector Output Shape: {out.shape}")  # Should be (2, 16, 256)
+    
+    # Backward Test (Check STE)
+    loss = out.mean()
+    loss.backward()
+    
+    # Check if RNN scorer got gradients
+    print(f"RNN Scorer Weight Grad: {selector.scorer.weight.grad is not None}")
+    if selector.scorer.weight.grad is not None:
+         print(f"Gradient norm: {selector.scorer.weight.grad.norm().item()}")
     
     # Load if exists (skip for now, just test shapes/forward)
     print("Running 1 episode...")
