@@ -40,174 +40,6 @@ def preprocess(obs):
     # Add batch dim -> (1, 1024)
     return torch.tensor(arr, dtype=torch.long).unsqueeze(0)
 
-class Selector(nn.Module):
-    def __init__(self, latent_dim=256, k=16, patch_size=4, img_size=32):
-        super().__init__()
-        self.k = k
-        self.patch_size = patch_size
-        self.num_patches = (img_size // patch_size) ** 2
-        self.patch_dim = latent_dim # CNN outputs latent_dim channels
-
-        # CNN: Extract features for each patch
-        # Input: (B, 1, 32, 32)
-        # We want to maintain spatial structure to define patches.
-        # Let's use a simple CNN that outputs (B, Dim, 8, 8) for 4x4 patches (32/4=8)
-        self.cnn = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, latent_dim, kernel_size=3, padding=1), # (B, Dim, 32, 32)
-            nn.MaxPool2d(kernel_size=patch_size, stride=patch_size) # (B, Dim, 8, 8)
-        )
-        
-        # RNN to score patches
-        # Input to RNN: Sequence of patches (B, NumPatches, LatentDim)
-        self.rnn = nn.GRU(input_size=latent_dim, hidden_size=128, batch_first=True)
-        self.scorer = nn.Linear(128, 1) # Output score for each patch
-
-        # Attention Block
-        self.attn = nn.MultiheadAttention(embed_dim=latent_dim, num_heads=4, batch_first=True)
-        
-    def forward(self, x):
-        """
-        x: (B, 1024) Observation
-        Returns: (B, K, LatentDim) Selected patches processed
-        """
-        B = x.shape[0]
-        # Reshape to image
-        x = x.view(B, 1, 32, 32).float() / 255.0
-        
-        # 1. CNN Feature Extraction
-        # (B, LatentDim, 8, 8)
-        features = self.cnn(x)
-        
-        # Flatten spatial dims to sequence of patches
-        # (B, LatentDim, 64) -> (B, 64, LatentDim)
-        patches = features.flatten(2).transpose(1, 2)
-        
-        # 2. RNN Scoring
-        # rnn_out: (B, 64, Hidden)
-        rnn_out, _ = self.rnn(patches) 
-        # scores: (B, 64, 1) -> (B, 64)
-        scores = self.scorer(rnn_out).squeeze(-1)
-        
-        # 3. Top-K Selection with Straight-Through Estimator
-        # Forward pass: Pick Top K
-        # We want a binary mask M where M[i] = 1 if i in TopK else 0
-        
-        # Get TopK indices
-        # topk_indices: (B, K)
-        _, topk_indices = torch.topk(scores, self.k, dim=1)
-        
-        # Create mask
-        mask = torch.zeros_like(scores)
-        mask.scatter_(1, topk_indices, 1.0)
-        
-        # Straight-Through Estimator
-        # Forward: use mask (binary)
-        # Backward: treat mask as equal to scores (or sigmoid of scores, but here we just pass gradients through)
-        # A common simple STE for selection is:
-        # y = hard + (soft - soft.detach())
-        # Here we don't have a perfect "soft" equivalent that sums to K easily without softmax temp annealing.
-        # But we can just say: mask_ste = mask - scores.detach() + scores
-        # This way d(mask_ste)/d(scores) = 1.
-        mask_ste = mask - scores.detach() + scores
-        
-        # We need to select the patches. 
-        # We can't just multiply by mask because we want to reduce the sequence length to K.
-        # But for the gradient to flow back to 'scores' through 'mask_ste', 'mask_ste' must be used in the computation.
-        
-        # Standard Index Select (No Gradient to indices usually)
-        # But we want gradient to 'scores' that determined the indices.
-        # The standard "Hard Attention" or "ST Gumbel Softmax" approach uses the weighted sum 
-        # but forces weights to be one-hot (or k-hot).
-        
-        # Let's try: Weighted sum where weights are mask_ste (0 or 1 effectively).
-        # This keeps shape (B, 64, Dim). To get (B, K, Dim), we usually just index.
-        # If we index typically, we lose gradients w.r.t selection likelihood unless we use REINFORCE.
-        # THE USER wants "Straight-Through Estimator".
-        # "You take the RNN's scores, pick the top K patches (1s) and discard the rest (0s).
-        # Backward Pass: You cheat. You tell the computer to ignore the 0/1 selection and act 
-        # as if the "heavy model" was directly connected to the RNN's scores."
-        
-        # Interpretation:
-        # We want the downstream model to receive the selected patches.
-        # If we just Pass selected patches, we essentially have:
-        # Output = Patches[Indices]
-        # The Indices came from Scores.
-        # Operations:
-        # 1. Softmax/Sigmoid Scores -> Weights
-        # 2. Hard selection (TopK) -> Mask
-        # 3. y = Mask * Patches  (Shape B, N, D) -> Then gather?
-        # If we implement literally "act as if heavy model was directly connected to RNN's scores":
-        # Maybe we weight the selected patches by the score?
-        # Or better: passed_patches = selected_patches * score_of_selected_patch / score_of_selected_patch.detach()
-        # This scales by 1.0 but attaches the gradient.
-        
-        # Let's do this:
-        # Gather the scores for the top k
-        topk_scores = torch.gather(scores, 1, topk_indices) # (B, K)
-        # Re-attach gradient:
-        # We want dL/dScore to be active.
-        # We can multiply features by (score / score.detach()) NO, that's 1.
-        # We effectively want "Mask" to have gradient 1 w.r.t Score.
-        # mask_ste has gradient 1 w.r.t. Score.
-        # output = patches * mask_ste.unsqueeze(-1)  -> This is (B, 64, Dim) with masked out zeros.
-        # Then we select the non-zeros.
-        
-        # But Tensor extraction (indexing) is not differentiable w.r.t indices.
-        # However, if we do:
-        # valid_patches = patches * mask_ste.unsqueeze(-1)
-        # selected = [extract non-zeros]
-        # The extraction isn't diff, but the VALUES are scaled by mask_ste (approx 1 or 0 + grad).
-        
-        # Simpler approach often used in Vision Transformers (e.g. Dynamic ViT):
-        # Keep all patches but zero out the dropped ones?
-        # User said: "pick the top K patches (1s) and discard the rest (0s)."
-        # "this patches will pass through an attention block". Sequence length usually matters for efficiency.
-        # If we just zero them out, self-attention still is N^2 (unless masked).
-        # But the User implies "efficiency of 0/1 selection". So we should actually reduce K.
-        
-        # Implementation:
-        # 1. Identify indices.
-        # 2. Gather patches: selected_patches = torch.gather(patches, 1, topk_indices.unsqueeze(-1).expand(-1, -1, LatentDim))
-        # 3. Gather scores: selected_scores = torch.gather(scores, 1, topk_indices)
-        # 4. Multiply: selected_patches = selected_patches * (selected_scores / selected_scores.detach()).unsqueeze(-1)
-        # This way, the content of the selected patch is multiplied by 1.0, 
-        # but the gradient flows to 'selected_scores', which flows to 'scores'.
-        # This seems to match the "cheat" logic.
-        
-        # However, there's a risk: if Score < 0, this flips sign. 
-        # Maybe sigmoid the scores first? or 1 + score - score.detach()
-        # Let's use the additive STE:
-        # proxy = selected_scores - selected_scores.detach() + 1.0
-        # selected_patches = selected_patches * proxy.unsqueeze(-1)
-        
-        selected_patches = torch.gather(patches, 1, topk_indices.unsqueeze(-1).expand(-1, -1, self.patch_dim)) # (B, K, Dim) (Note: reusing latent_dim for convenience, but actually patch_dim might be different if not projected, but here cnn outputs latent_dim)
-        selected_scores = torch.gather(scores, 1, topk_indices) # (B, K)
-        
-        # STE
-        # We want the selection to be sensitive to the score.
-        # If score goes up, we want to encourage efficient selection?
-        # Actually, standard STE on binary mask usually works on the mask generation step.
-        # Since we are essentially doing "Hard Attention", let's follow the standard:
-        # y = y_hard - y_soft.detach() + y_soft
-        # Here we don't have y_soft easily for the gathered tensor.
-        # Let's try the multiplicative trick which represents "how much this patch contributes".
-        # If we want the network to learn WHICH to pick, the gradient must say "if this had a higher score, loss would decrease".
-        # The multiplicative term `selected_patches * selected_scores` provides a gradient to scores.
-        
-        # User said: "act as if the "heavy model" was directly connected to the RNN's scores."
-        # If I multiply by score, the heavy model sees `patch * score`.
-        # If I multiply by `(1 + score - score.detach())`, the heavy model sees `patch` (approximated) but gradients flow to score.
-        
-        proxy = selected_scores - selected_scores.detach() + 1.0
-        selected_patches = selected_patches * proxy.unsqueeze(-1)
-        
-        # 4. Attention Block
-        # Input (B, K, Dim)
-        attn_out, _ = self.attn(selected_patches, selected_patches, selected_patches)
-        
-        return attn_out
 
 class RewardModel(nn.Module):
     def __init__(self, latent_dim):
@@ -256,17 +88,33 @@ class MBRLAgent:
     def __init__(self, device=DEVICE):
         self.device = device
         
-        # World Model (TRM)
-        network = MLPMixer1D(
+        # Evolution Model (EM): (Obs, Action) -> Latents
+        # Predicts the evolution of the world state
+        em_network = MLPMixer1D(
             dim=LATENT_DIM,
             depth=2,
-            seq_len=SEQ_LEN
+            seq_len=SEQ_LEN # 1025 (1024 + 1)
         )
-        self.trm = TinyRecursiveModel(
+        self.evolution_model = TinyRecursiveModel(
             dim=LATENT_DIM,
-            num_tokens=256 + NUM_ACTIONS, # 256 pixels + 4 actions
-            network=network,
-            num_refinement_blocks=2,      # Slightly reduced for speed
+            num_tokens=256 + NUM_ACTIONS, 
+            network=em_network,
+            num_refinement_blocks=2,
+            num_latent_refinements=2
+        ).to(device)
+
+        # Observation Model (OM): (Obs, EvolutionLatents) -> Next Obs
+        # Predicts next pixels given current pixels and evolution latents
+        om_network = MLPMixer1D(
+            dim=LATENT_DIM,
+            depth=2,
+            seq_len=SEQ_LEN - 1 # 1024 pixels
+        )
+        self.observation_model = TinyRecursiveModel(
+            dim=LATENT_DIM,
+            num_tokens=256 + NUM_ACTIONS,
+            network=om_network,
+            num_refinement_blocks=2,
             num_latent_refinements=2
         ).to(device)
         
@@ -275,7 +123,9 @@ class MBRLAgent:
         self.critic = Critic(LATENT_DIM).to(device)
         
         self.wm_optim = AdamW(
-            list(self.trm.parameters()) + list(self.reward_model.parameters()), 
+            list(self.evolution_model.parameters()) + 
+            list(self.observation_model.parameters()) + 
+            list(self.reward_model.parameters()), 
             lr=1e-4
         )
         self.ac_optim = AdamW(
@@ -283,34 +133,35 @@ class MBRLAgent:
             lr=1e-4
         )
         
-        # Training state
-        self.wm_outputs, self.wm_latents = self.trm.get_initial()
-        self.wm_outputs = self.wm_outputs.to(device)
-        self.wm_latents = self.wm_latents.to(device)
+        # Training state (Track Evolution Model State)
+        self.em_outputs, self.em_latents = self.evolution_model.get_initial()
+        self.em_outputs = self.em_outputs.to(device)
+        self.em_latents = self.em_latents.to(device)
 
     def reset_internal_state(self):
-        self.wm_outputs, self.wm_latents = self.trm.get_initial()
-        self.wm_outputs = self.wm_outputs.to(self.device)
-        self.wm_latents = self.wm_latents.to(self.device)
+        self.em_outputs, self.em_latents = self.evolution_model.get_initial()
+        self.em_outputs = self.em_outputs.to(self.device)
+        self.em_latents = self.em_latents.to(self.device)
 
     def get_action(self, obs_seq, deterministic=False):
         """
         Get action from Actor based on current observation and internal state.
-        This also advances the TRM internal state estimate!
+        Uses Evolution Model to estimate state.
         """
         with torch.no_grad():
             # Create a "proposal" input with the current pixels and a dummy action
-            # to see what the model "thinks" about this state.
             dummy_action = torch.tensor([[256]], device=self.device) # Action 0 token (256)
             
-            # obs_seq: (1, 1024)
+            # input: (Obs, Action)
             input_full = torch.cat([obs_seq, dummy_action], dim=1)
             
-            # Run one pass to get latents (don't overwrite self.wm_latents yet)
-            _, prop_latents, _, _ = self.trm(
+            # Run one pass of Evolution Model
+            # This gives us the "Next State" if we took dummy action (or just current state representation)
+            # effectively processing the observation into the latent space
+            _, prop_latents, _, _ = self.evolution_model(
                 input_full, 
-                self.wm_outputs, 
-                self.wm_latents
+                self.em_outputs, 
+                self.em_latents
             )
             
             logits = self.actor(prop_latents)
@@ -324,96 +175,105 @@ class MBRLAgent:
 
     def update_internal_state(self, obs_seq, action):
         """
-        After taking an action, we update the persistent TRM state with the Tuple (Obs, Action).
+        Update the persistent Evolution Model state with real (Obs, Action).
         """
-        # Map action 0-3 to 256-259
         action_token = torch.tensor([[256 + action]], device=self.device)
         input_full = torch.cat([obs_seq, action_token], dim=1)
         
         with torch.no_grad():
-            self.wm_outputs, self.wm_latents, _, _ = self.trm(
+            self.em_outputs, self.em_latents, _, _ = self.evolution_model(
                 input_full,
-                self.wm_outputs,
-                self.wm_latents
+                self.em_outputs,
+                self.em_latents
             )
 
     def train_world_model(self, batch):
         """
-        Train TRM (Next state prediction) + Reward Model.
-        Batch: (Obs, Action, Reward, NextObs, Done)
+        Train Evolution Model (Dynamics) + Observation Model (Reconstruction).
         """
-        # Unpack batch
         obs_b, act_b, rew_b, next_obs_b, done_b = batch
         
-        # Prepare Inputs: [Obs, Act]
-        # act_b is (B, 1) in range 0-3. Map to 256-259.
+        # 1. Prepare Inputs for Evolution Model: [Obs, Act]
         act_tokens = act_b + 256
-        input_full = torch.cat([obs_b, act_tokens], dim=1)
+        em_input = torch.cat([obs_b, act_tokens], dim=1)
         
-        # Prepare Targets: [NextObs, Dummy]
-        dummy_token = torch.zeros((obs_b.size(0), 1), device=self.device, dtype=torch.long)
-        target_full = torch.cat([next_obs_b, dummy_token], dim=1)
+        # Get fresh initial states for EM
+        init_outputs, init_latents = self.evolution_model.get_initial()
         
-        # Get fresh initial states for the batch (approximated)
-        
-        init_outputs, init_latents = self.trm.get_initial()
-        
+        # Expand to correct sequence length (SEQ_LEN = 1025)
         curr_outputs = init_outputs.expand(obs_b.size(0), SEQ_LEN, LATENT_DIM)
         curr_latents = init_latents.expand(obs_b.size(0), SEQ_LEN, LATENT_DIM)
-        
-        # TRM Forward
-        loss_wm, losses_wm, final_h, final_z, pred_logits, halt = self.trm(
-            input_full,
+
+        # EM Forward
+        result = self.evolution_model(
+            em_input,
             curr_outputs,
             curr_latents,
-            labels=target_full
+            labels=None
+        )
+        # When labels=None, returns (outputs, latents, pred, halt_prob)
+        em_outputs_res, em_final_z, em_pred, _ = result
+        
+        # em_final_z is (B, 1025, Dim). 
+        # Map EM latents to OM latents (B, 1024, Dim).
+        om_context_latents = em_final_z[:, :1024, :]
+        
+        # Prepare OM inputs: Obs
+        # Initial outputs for OM: Clean init
+        om_outputs = self.observation_model.output_init_embed.expand(obs_b.size(0), 1024, LATENT_DIM)
+        
+        # OM Forward (Predict Next Obs)
+        loss_om, losses_om, _, final_z_om, _, _ = self.observation_model(
+            obs_b, # Input: Current Obs
+            om_outputs,
+            om_context_latents, # Latents from EM
+            labels=next_obs_b # Target: Next Obs
         )
         
         # Reward Prediction
-        # We use the 'final_z' (Latents after processing Input) to predict Reward.
-        pred_reward = self.reward_model(final_z)
+        # User: "actor/critic/value will use the predicted evolution of the world"
+        pred_reward = self.reward_model(em_final_z)
         loss_reward = F.mse_loss(pred_reward, rew_b)
         
-        total_loss = loss_wm + loss_reward
+        total_loss = loss_om + loss_reward
         
         self.wm_optim.zero_grad()
         total_loss.backward()
         self.wm_optim.step()
         
         return {
-            "loss_wm": loss_wm.item(),
+            "loss_wm": loss_om.item(),
             "loss_reward": loss_reward.item()
         }
 
     def imagine(self, start_obs, horizon=15):
         """
-        Generate imagined trajectories starting from 'start_obs' using the Policy.
-        Returns data for training Actor-Critic.
+        Imagine leveraging Evolution Model.
         """
-        # Start state initialization
         b_size = start_obs.size(0)
         
-        outputs = self.trm.output_init_embed.expand(b_size, SEQ_LEN, LATENT_DIM)
-        latents = self.trm.latent_init_embed.expand(b_size, SEQ_LEN, LATENT_DIM)
+        # Initialize EM state (SEQ_LEN = 1025)
+        em_outputs = self.evolution_model.output_init_embed.expand(b_size, SEQ_LEN, LATENT_DIM)
+        em_latents = self.evolution_model.latent_init_embed.expand(b_size, SEQ_LEN, LATENT_DIM)
         
         curr_obs = start_obs
         
-        trajectory_states = []
-        trajectory_actions = []
-        trajectory_rewards = []
-        trajectory_values = []
-        trajectory_log_probs = []
+        traj_states = []
+        traj_actions = []
+        traj_rewards = []
+        traj_values = []
+        traj_log_probs = []
         
         for t in range(horizon):
-            # 1. Select Action using internal state (We need to "peek" effectively)
-            # Use a dummy action to process the 'curr_obs' into a latent state for the Actor
+            # 1. Select Action (Policy uses EM latents)
+            # Peek with dummy action
             dummy_act = torch.full((b_size, 1), 256, device=self.device)
             in_peek = torch.cat([curr_obs, dummy_act], dim=1)
             
-            with torch.no_grad(): # Use VM, don't train it here
-                _, lat_peek, _, _ = self.trm(in_peek, outputs, latents)
+            with torch.no_grad():
+                _, lat_peek, _, _ = self.evolution_model(in_peek, em_outputs, em_latents)
                 
-            # Actor & Critic
+            # Actor & Critic use lat_peek
             logits = self.actor(lat_peek)
             value = self.critic(lat_peek)
             
@@ -421,37 +281,45 @@ class MBRLAgent:
             action = dist.sample()
             log_prob = dist.log_prob(action)
             
-            # 2. Step World Model with REAL action
-            # Map action 0-3 -> 256-259
+            # 2. Step Environment (Imagined)
+            # Step EM with Real Action
             act_tokens = action.unsqueeze(1) + 256
             input_step = torch.cat([curr_obs, act_tokens], dim=1)
             
             with torch.no_grad():
-                # Step TRM
-                outputs, latents, pred_logits, _ = self.trm(
+                # Evolve EM
+                em_outputs, em_latents, _, _ = self.evolution_model(
                     input_step,
-                    outputs,
-                    latents
+                    em_outputs,
+                    em_latents
                 )
                 
-                # Predict Reward
-                reward = self.reward_model(latents)
+                # Predict Reward (from EM)
+                reward = self.reward_model(em_latents)
                 
-                # Predict Next Obs (Greedy for now)
-                # pred_logits: (B, Seq, Vocab)
-                # We need the observation part
-                next_obs_pred = pred_logits[:, :1024, :].argmax(dim=-1) # (B, 1024)
+                # Predict Next Obs (using OM)
+                # OM Inputs: Current Obs
+                # OM Latents: New EM Latents (chopped)
+                om_outputs_init = self.observation_model.output_init_embed.expand(b_size, 1024, LATENT_DIM)
+                om_context = em_latents[:, :1024, :]
                 
-            # Store
-            trajectory_states.append(lat_peek) # Store the state utilized for decision
-            trajectory_actions.append(action)
-            trajectory_rewards.append(reward)
-            trajectory_values.append(value.detach())
-            trajectory_log_probs.append(log_prob.detach())
+                _, _, pred_logits_om, _ = self.observation_model(
+                    curr_obs,
+                    om_outputs_init,
+                    om_context
+                )
+                
+                next_obs_pred = pred_logits_om.argmax(dim=-1)
+                
+            traj_states.append(lat_peek)
+            traj_actions.append(action)
+            traj_rewards.append(reward)
+            traj_values.append(value.detach())
+            traj_log_probs.append(log_prob.detach())
             
             curr_obs = next_obs_pred
             
-        return (trajectory_states, trajectory_actions, trajectory_rewards, trajectory_values, trajectory_log_probs)
+        return (traj_states, traj_actions, traj_rewards, traj_values, traj_log_probs)
 
     def update_ac(self, rollouts):
         """
@@ -596,7 +464,8 @@ def train():
         if step % 100 == 0:
             print(f"Step {step}")
             
-    torch.save(agent.trm.state_dict(), "model/whole_trm.pth")
+    torch.save(agent.evolution_model.state_dict(), "model/whole_em.pth")
+    torch.save(agent.observation_model.state_dict(), "model/whole_om.pth")
     torch.save(agent.actor.state_dict(), "model/whole_actor.pth")
     env.close()
 
@@ -605,23 +474,23 @@ def test():
     env = gym.make('ALE/Breakout-v5', render_mode='rgb_array')
     agent = MBRLAgent()
     
-    # Test Selector
-    print("Testing Selector...")
-    selector = Selector(latent_dim=256, k=16).to(DEVICE)
-    dummy_obs = torch.randint(0, 255, (2, 1024)).to(DEVICE) # Batch 2
+    # Test Selector (Broken/Missing Class - Commented Out)
+    # print("Testing Selector...")
+    # selector = Selector(latent_dim=256, k=16).to(DEVICE)
+    # dummy_obs = torch.randint(0, 255, (2, 1024)).to(DEVICE) # Batch 2
     
     # Forward
-    out = selector(dummy_obs)
-    print(f"Selector Output Shape: {out.shape}")  # Should be (2, 16, 256)
+    # out = selector(dummy_obs)
+    # print(f"Selector Output Shape: {out.shape}")  # Should be (2, 16, 256)
     
     # Backward Test (Check STE)
-    loss = out.mean()
-    loss.backward()
+    # loss = out.mean()
+    # loss.backward()
     
     # Check if RNN scorer got gradients
-    print(f"RNN Scorer Weight Grad: {selector.scorer.weight.grad is not None}")
-    if selector.scorer.weight.grad is not None:
-         print(f"Gradient norm: {selector.scorer.weight.grad.norm().item()}")
+    # print(f"RNN Scorer Weight Grad: {selector.scorer.weight.grad is not None}")
+    # if selector.scorer.weight.grad is not None:
+    #      print(f"Gradient norm: {selector.scorer.weight.grad.norm().item()}")
     
     # Load if exists (skip for now, just test shapes/forward)
     print("Running 1 episode...")
