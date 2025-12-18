@@ -84,6 +84,29 @@ class Critic(nn.Module):
         pooled = latents.mean(dim=1)
         return self.net(pooled)
 
+class ObservationModel(nn.Module):
+    def __init__(self, latent_dim, num_tokens=256):
+        super().__init__()
+        self.embedding = nn.Embedding(num_tokens, latent_dim)
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim * 2, 512),
+            nn.ReLU(),
+            nn.Linear(512, num_tokens)
+        )
+
+    def forward(self, obs, context_latents, labels=None):
+        # obs: (B, 1024) - current pixels
+        # context_latents: (B, 1024, latent_dim) - dynamics from EM
+        obs_emb = self.embedding(obs)
+        combined = torch.cat([obs_emb, context_latents], dim=-1) # (B, 1024, latent_dim * 2)
+        logits = self.net(combined) # (B, 1024, 256)
+        
+        loss = None
+        if labels is not None:
+            loss = F.cross_entropy(logits.view(-1, 256), labels.view(-1))
+            
+        return logits, loss
+
 class MBRLAgent:
     def __init__(self, device=DEVICE):
         self.device = device
@@ -105,18 +128,7 @@ class MBRLAgent:
 
         # Observation Model (OM): (Obs, EvolutionLatents) -> Next Obs
         # Predicts next pixels given current pixels and evolution latents
-        om_network = MLPMixer1D(
-            dim=LATENT_DIM,
-            depth=2,
-            seq_len=SEQ_LEN - 1 # 1024 pixels
-        )
-        self.observation_model = TinyRecursiveModel(
-            dim=LATENT_DIM,
-            num_tokens=256 + NUM_ACTIONS,
-            network=om_network,
-            num_refinement_blocks=2,
-            num_latent_refinements=2
-        ).to(device)
+        self.observation_model = ObservationModel(LATENT_DIM).to(device)
         
         self.reward_model = RewardModel(LATENT_DIM).to(device)
         self.actor = Actor(LATENT_DIM, NUM_ACTIONS).to(device)
@@ -219,13 +231,9 @@ class MBRLAgent:
         om_context_latents = em_final_z[:, :1024, :]
         
         # Prepare OM inputs: Obs
-        # Initial outputs for OM: Clean init
-        om_outputs = self.observation_model.output_init_embed.expand(obs_b.size(0), 1024, LATENT_DIM)
-        
         # OM Forward (Predict Next Obs)
-        loss_om, losses_om, _, final_z_om, _, _ = self.observation_model(
+        pred_logits_om, loss_om = self.observation_model(
             obs_b, # Input: Current Obs
-            om_outputs,
             om_context_latents, # Latents from EM
             labels=next_obs_b # Target: Next Obs
         )
@@ -243,7 +251,8 @@ class MBRLAgent:
         
         return {
             "loss_wm": loss_om.item(),
-            "loss_reward": loss_reward.item()
+            "loss_reward": loss_reward.item(),
+            "pred_obs": pred_logits_om.detach()
         }
 
     def imagine(self, start_obs, horizon=15):
@@ -300,12 +309,10 @@ class MBRLAgent:
                 # Predict Next Obs (using OM)
                 # OM Inputs: Current Obs
                 # OM Latents: New EM Latents (chopped)
-                om_outputs_init = self.observation_model.output_init_embed.expand(b_size, 1024, LATENT_DIM)
                 om_context = em_latents[:, :1024, :]
                 
-                _, _, pred_logits_om, _ = self.observation_model(
+                pred_logits_om, _ = self.observation_model(
                     curr_obs,
-                    om_outputs_init,
                     om_context
                 )
                 
@@ -397,6 +404,8 @@ def train():
     
     print("Pre-filling buffer...")
     obs, _ = env.reset()
+    # Force FIRE to start the game
+    obs, _, _, _, _ = env.step(1)
     curr_seq = preprocess(obs) # (1, 1024)
     
     # Collect some data with random policy
@@ -411,6 +420,8 @@ def train():
         curr_seq = next_seq
         if done:
             obs, _ = env.reset()
+            # Force FIRE to start the game
+            obs, _, _, _, _ = env.step(1)
             curr_seq = preprocess(obs)
             
     print("Starting Training...")
@@ -437,6 +448,8 @@ def train():
         
         if done:
             obs, _ = env.reset()
+            # Force FIRE to start the game
+            obs, _, _, _, _ = env.step(1)
             curr_seq = preprocess(obs)
             agent.reset_internal_state() # Important for RNN
             
@@ -453,6 +466,19 @@ def train():
             
             metrics = agent.train_world_model((b_obs, b_act, b_rew, b_next, b_done))
             
+            # Reconstruction Visualization
+            if step % 50 == 0:
+                # Take first sample from batch
+                pred_pixels = metrics["pred_obs"][0].argmax(dim=-1).cpu().numpy().reshape(32, 32)
+                target_pixels = b_next[0].cpu().numpy().reshape(32, 32)
+                
+                # Stack comparison
+                vis_img = np.hstack([target_pixels, pred_pixels])
+                metrics["reconstruction"] = wandb.Image(vis_img, caption="Actual vs Predicted")
+            
+            # Remove pred_obs from dict before logging to wandb
+            del metrics["pred_obs"]
+
             # 3. Imagine & Train Actor-Critic
             # Imagine starting from real states in the batch
             rollouts = agent.imagine(b_obs, horizon=10)
@@ -473,28 +499,12 @@ def test():
     print("Testing MBRL Agent...")
     env = gym.make('ALE/Breakout-v5', render_mode='rgb_array')
     agent = MBRLAgent()
-    
-    # Test Selector (Broken/Missing Class - Commented Out)
-    # print("Testing Selector...")
-    # selector = Selector(latent_dim=256, k=16).to(DEVICE)
-    # dummy_obs = torch.randint(0, 255, (2, 1024)).to(DEVICE) # Batch 2
-    
-    # Forward
-    # out = selector(dummy_obs)
-    # print(f"Selector Output Shape: {out.shape}")  # Should be (2, 16, 256)
-    
-    # Backward Test (Check STE)
-    # loss = out.mean()
-    # loss.backward()
-    
-    # Check if RNN scorer got gradients
-    # print(f"RNN Scorer Weight Grad: {selector.scorer.weight.grad is not None}")
-    # if selector.scorer.weight.grad is not None:
-    #      print(f"Gradient norm: {selector.scorer.weight.grad.norm().item()}")
-    
+   
     # Load if exists (skip for now, just test shapes/forward)
     print("Running 1 episode...")
     obs, _ = env.reset()
+    # Force FIRE to start the game
+    obs, _, _, _, _ = env.step(1)
     curr_seq = preprocess(obs).to(DEVICE)
     done = False
     
