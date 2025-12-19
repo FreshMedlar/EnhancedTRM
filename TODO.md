@@ -9,7 +9,6 @@ reinforcement learning
 - [ ] create hierarchical representation of the world model to have high level goals
 
 # close next
-- [ ] rnn to select vision patches
-        problem: the world model can't predict the part he can't even see because it's not even passed by the rnn
-        solution: we predict the evolution of the world, and we have another model (that we don't use) to predict the world given the evolution of the world
-- [ ] attn block to analyze patches 
+- [ ] remember when we got reward, use it as objective
+        model to remember (easy)
+        model to reach goal (hard)
