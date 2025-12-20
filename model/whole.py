@@ -304,7 +304,10 @@ def test():
     dummy_act = torch.zeros((2, 1), dtype=torch.long).to(DEVICE)
     dummy_next = torch.randint(0, 255, (2, PIXELS)).to(DEVICE)
     
-    batch = (dummy_obs, dummy_act, None, dummy_next, None)
+    dummy_rew = torch.zeros((2, 1), dtype=torch.float).to(DEVICE)
+    dummy_done = torch.zeros((2, 1), dtype=torch.float).to(DEVICE)
+    
+    batch = (dummy_obs, dummy_act, dummy_rew, dummy_next, dummy_done)
     metrics = agent.train_world_model(batch)
     print(f"WM Loss: {metrics['loss_wm']:.4f}")
     
