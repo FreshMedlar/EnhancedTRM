@@ -24,13 +24,15 @@ VOCAB_SIZE = 256 + NUM_ACTIONS + 2 # 0-255 pixels, 4 actions, 2 specials (SOS, P
 # 0-255: Pixels
 # 256-259: Actions (Action 0 -> 256, etc.)
 # 260: SOS (Start of Sequence) / Separator if needed
+# 261-276: Rewards (0-15)
 ACTION_OFFSET = 256
 SOS_TOKEN = 260
-TOTAL_VOCAB_SIZE = 261
+REWARD_OFFSET = 261
+TOTAL_VOCAB_SIZE = 277
 
-# Seq definition: [Obs (256), Action (1), NextObs (256)]
-# Context length needed: 256 + 1 + 256 = 513
-MAX_SEQ_LEN = 513 
+# Seq definition: [Obs (256), Action (1), NextObs (256), Reward (1)]
+# Context length needed: 256 + 1 + 256 + 1 = 514
+MAX_SEQ_LEN = 514 
 LATENT_DIM = 128 # d_model
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -96,35 +98,60 @@ class MBRLAgent:
                 
         return action, log_prob, value, state
 
+    def imagine(self, obs, action):
+        """
+        Predict next_obs and reward given current obs and action.
+        Sequence structure: [Obs (256), Action (1), NextObs (256), Reward (1)]
+        """
+        self.world_model.eval()
+        with torch.no_grad():
+            act_token = torch.tensor([[action + ACTION_OFFSET]], device=self.device)
+            # Input: [Obs, Action]
+            inp = torch.cat([obs, act_token], dim=1)
+            
+            # Generate NextObs (256 pixels) + Reward (1 token)
+            generated = self.world_model.generate(inp, steps=PIXELS + 1)
+            
+            # Extract components
+            # generated shape: (1, 256 + 1 + 256 + 1) = (1, 514)
+            pred_next_obs = generated[:, PIXELS+1 : PIXELS+1+PIXELS]
+            pred_reward_token = generated[:, -1:]
+            pred_reward = pred_reward_token - REWARD_OFFSET
+            
+        self.world_model.train()
+        return pred_next_obs, pred_reward
+
     def train_world_model(self, batch):
         obs_b, act_b, rew_b, next_obs_b, done_b = batch
         B = obs_b.size(0)
         
-        act_tokens = act_b + ACTION_OFFSET
-        full_seq = torch.cat([obs_b, act_tokens, next_obs_b], dim=1) # (B, 513)
+        # Prepare Reward Tokens
+        # Clip reward to 0-15 just in case, and add offset
+        # We assume rewards are integers. Breakout rewards are 0, 1, 4, 7...
+        rew_int = rew_b.long().clamp(0, 15)
+        rew_tokens = rew_int + REWARD_OFFSET
+        
+        # Sequence: Obs, Action, NextObs, Reward
+        full_seq = torch.cat([obs_b, act_tokens, next_obs_b, rew_tokens], dim=1) # (B, 514)
         
         inputs = full_seq[:, :-1] 
         targets = full_seq[:, 1:] 
         
-        logits, _, (rew_pred, done_pred) = self.world_model(inputs)
+        logits, _, (_, done_pred) = self.world_model(inputs)
         
-        # 1. Pixel/Token Loss (Dynamics)
+        # 1. Pixel/Token Loss (Dynamics) + Reward Token Loss
         loss_tokens = F.cross_entropy(logits.reshape(-1, TOTAL_VOCAB_SIZE), targets.reshape(-1))
         
-        # 2. Reward and Done Loss (Objectives)
-        # We want to predict the reward/done based on the state after the action is taken.
-        # Action is at index 256 in the full_seq (0-indexed).
-        # So in 'inputs' (length 512), index 256 is the action token.
-        # Its embedding has seen (Obs + Action). This is when we can predict Reward and NextObs.
-        pred_idx = PIXELS # The index of the action token
+        # 2. Done Loss (Objective)
+        # We predict Done based on the state after Action is taken.
+        # Action is at index 256.
+        pred_idx = PIXELS # Index of action token
         
-        target_rew = rew_b.float() # (B, 1)
         target_done = done_b.float() # (B, 1)
         
-        loss_rew = F.mse_loss(rew_pred[:, pred_idx, :], target_rew)
         loss_done = F.binary_cross_entropy_with_logits(done_pred[:, pred_idx, :], target_done)
         
-        total_loss = loss_tokens + 10.0 * loss_rew + 5.0 * loss_done
+        total_loss = loss_tokens + 5.0 * loss_done
         
         self.wm_optim.zero_grad()
         total_loss.backward()
@@ -132,7 +159,6 @@ class MBRLAgent:
         
         return {
             "loss_wm": loss_tokens.item(),
-            "loss_rew": loss_rew.item(),
             "loss_done": loss_done.item(),
             "pred_logits": logits.detach()
         }
@@ -278,13 +304,14 @@ def train():
             wm_metrics = agent.train_world_model((b_obs, b_act, b_rew, b_next, b_done))
             
             if step % 500 == 0:
-                pred_logits = wm_metrics["pred_logits"]
-                pred_pixels_logits = pred_logits[0, PIXELS:2*PIXELS, :]
-                pred_pixels = pred_pixels_logits.argmax(dim=-1).cpu().numpy().astype(np.uint8).reshape(IMG_SIZE, IMG_SIZE)
+                # Use the new imagine function to see how it performs without teacher forcing
+                pred_obs, pred_rew = agent.imagine(b_obs[0:1], b_act[0].item())
+                
+                pred_pixels = pred_obs[0].cpu().numpy().astype(np.uint8).reshape(IMG_SIZE, IMG_SIZE)
                 target_pixels = b_next[0].cpu().numpy().astype(np.uint8).reshape(IMG_SIZE, IMG_SIZE)
                 
                 vis_img = np.hstack([target_pixels, pred_pixels])
-                wm_metrics["reconstruction"] = wandb.Image(vis_img, caption="Actual vs Predicted")
+                wm_metrics["reconstruction"] = wandb.Image(vis_img, caption=f"Actual vs Predicted (Rew: {pred_rew.item()})")
                 
             del wm_metrics["pred_logits"]
             wandb.log(wm_metrics)
