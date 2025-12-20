@@ -12,3 +12,6 @@ reinforcement learning
 - [ ] remember when we got reward, use it as objective
         model to remember (easy)
         model to reach goal (hard)
+- [ ] error head (catches errors) initially catches the error state, then it learns to predict it in advance 
+        on errors, we replay the situation to get a different outcome. We dream it until we learn something
+- [ ] heads output as input
