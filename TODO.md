@@ -15,3 +15,6 @@ reinforcement learning
 - [ ] error head (catches errors) initially catches the error state, then it learns to predict it in advance 
         on errors, we replay the situation to get a different outcome. We dream it until we learn something
 - [ ] heads output as input
+
+- [ ] JEPA-style encoding 
+        encode for usefulness, be stimulated by new things

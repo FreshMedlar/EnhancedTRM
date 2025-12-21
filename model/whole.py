@@ -15,75 +15,55 @@ import sys
 import os
 from dataclasses import dataclass
 
-# Hyperparameters
-IMG_SIZE = 16
-PIXELS = IMG_SIZE * IMG_SIZE # 256
+# Constants
+IMG_SIZE = 128
 NUM_ACTIONS = 4
-VOCAB_SIZE = 256 + NUM_ACTIONS + 2 # 0-255 pixels, 4 actions, 2 specials (SOS, PAD/EOS if needed)
-# Token mapping
-# 0-255: Pixels
-# 256-259: Actions (Action 0 -> 256, etc.)
-# 260: SOS (Start of Sequence) / Separator if needed
-# 261-276: Rewards (0-15)
-ACTION_OFFSET = 256
-SOS_TOKEN = 260
-REWARD_OFFSET = 261
-TOTAL_VOCAB_SIZE = 277
-
-# Seq definition: [Obs (256), Action (1), NextObs (256), Reward (1)]
-# Context length needed: 256 + 1 + 256 + 1 = 514
-MAX_SEQ_LEN = 514 
 LATENT_DIM = 128 # d_model
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+FRAME_STACK = 4
 def preprocess(obs):
     """
-    Resize observation to 32x32 and convert to grayscale.
-    Returns: torch.Tensor of shape (1, 1024) with values 0-255 (Long)
+    Resize observation to 128x128, convert to grayscale, and return as tensor.
     """
-    img = Image.fromarray(obs)
-    img = img.resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
-    img = img.convert("L") # Grayscale
+    img = Image.fromarray(obs).convert("L") # Grayscale
+    img = img.resize((IMG_SIZE, IMG_SIZE), Image.NEAREST) # Nearest for small objects
     
-    # Flatten array to (1024,)
-    arr = np.array(img).flatten()
-    
-    # Add batch dim -> (1, 1024)
-    return torch.tensor(arr, dtype=torch.long).unsqueeze(0)
+    arr = np.array(img).astype(np.float32) / 255.0
+    return torch.tensor(arr, dtype=torch.float32).unsqueeze(0).unsqueeze(0) # (1, 1, 128, 128)
 
-from rwkv_model import RWKVConfig, RWKVWorldModel
+def stack_frames(frames_deque):
+    # frames_deque contains tensors of shape (1, 1, 128, 128)
+    return torch.cat(list(frames_deque), dim=1) # (1, FRAME_STACK, 128, 128)
+
 from networks import Actor, Critic
+from jepa import JEPAWorldModel, SIGReg
 
 class MBRLAgent:
     def __init__(self, device=DEVICE):
         self.device = device
         
-        # RWKV World Model
-        self.rwconfig = RWKVConfig(
-            vocab_size=TOTAL_VOCAB_SIZE,
-            block_size=MAX_SEQ_LEN,
-            n_embd=LATENT_DIM,
-            n_layer=2, 
-            use_customized_cuda_kernel=False
-        )
-        self.world_model = RWKVWorldModel(self.rwconfig).to(device)
-
+        self.wm = JEPAWorldModel(LATENT_DIM, NUM_ACTIONS, in_channels=FRAME_STACK).to(device)
+        self.sigreg = SIGReg().to(device)
+        self.goal_memory = [] # Store latent embeddings of successful states
+        self.max_goals = 1000
+        
         self.actor = Actor(LATENT_DIM, NUM_ACTIONS).to(device)
         self.critic = Critic(LATENT_DIM).to(device)
         
-        self.wm_optim = AdamW(self.world_model.parameters(), lr=3e-4)
+        self.wm_optim = AdamW(self.wm.parameters(), lr=1e-4) 
         self.ac_optim = AdamW(
             list(self.actor.parameters()) + list(self.critic.parameters()), 
             lr=1e-4
         )
 
-    def get_action(self, obs_seq, deterministic=False):
+    def get_action(self, obs, deterministic=False):
         """
         Get action, log_prob, value, and state embedding from current observation.
         """
         with torch.no_grad():
-            _, embeddings, _ = self.world_model(obs_seq)
-            state = embeddings[:, -1, :] 
+            # Obs: (1, 3, 128, 128)
+            _, state = self.wm.encoder(obs) # (1, LATENT_DIM)
             
             logits = self.actor(state)
             value = self.critic(state)
@@ -98,69 +78,78 @@ class MBRLAgent:
                 
         return action, log_prob, value, state
 
-    def imagine(self, obs, action):
+    def get_intrinsic_reward(self, state):
         """
-        Predict next_obs and reward given current obs and action.
-        Sequence structure: [Obs (256), Action (1), NextObs (256), Reward (1)]
+        Calculate max cosine similarity between state and goal memory.
+        state: (1, LATENT_DIM)
         """
-        self.world_model.eval()
-        with torch.no_grad():
-            act_token = torch.tensor([[action + ACTION_OFFSET]], device=self.device)
-            # Input: [Obs, Action]
-            inp = torch.cat([obs, act_token], dim=1)
-            
-            # Generate NextObs (256 pixels) + Reward (1 token)
-            generated = self.world_model.generate(inp, steps=PIXELS + 1)
-            
-            # Extract components
-            # generated shape: (1, 256 + 1 + 256 + 1) = (1, 514)
-            pred_next_obs = generated[:, PIXELS+1 : PIXELS+1+PIXELS]
-            pred_reward_token = generated[:, -1:]
-            pred_reward = pred_reward_token - REWARD_OFFSET
-            
-        self.world_model.train()
-        return pred_next_obs, pred_reward
+        if not self.goal_memory:
+            return 0.0
+        
+        # Stack goals: (N, LATENT_DIM)
+        # Check if we have enough goals to batch?
+        # Ideally keep goals as a tensor buffer
+        goals = torch.stack(self.goal_memory) # (N, D)
+        
+        # Normalize state and goals
+        state_norm = F.normalize(state, p=2, dim=1)
+        goals_norm = F.normalize(goals, p=2, dim=1)
+        
+        # Similarity: (1, D) @ (D, N) -> (1, N)
+        sim_scores = torch.mm(state_norm, goals_norm.t())
+        
+        max_sim = sim_scores.max().item()
+        return max_sim
 
     def train_world_model(self, batch):
         obs_b, act_b, rew_b, next_obs_b, done_b = batch
-        B = obs_b.size(0)
+        # obs_b: (B, 3, 128, 128)
         
-        # Prepare Reward Tokens
-        # Clip reward to 0-15 just in case, and add offset
-        # We assume rewards are integers. Breakout rewards are 0, 1, 4, 7...
-        rew_int = rew_b.long().clamp(0, 15)
-        rew_tokens = rew_int + REWARD_OFFSET
+        # 1. Encode current and next observations
+        _, proj_t = self.wm.encoder(obs_b) # h_t
+        _, proj_next = self.wm.encoder(next_obs_b) # h_{t+1} (Target)
         
-        # Sequence: Obs, Action, NextObs, Reward
-        full_seq = torch.cat([obs_b, act_tokens, next_obs_b, rew_tokens], dim=1) # (B, 514)
+        # 2. Predict next latent
+        act_emb = self.wm.act_embedding(act_b.squeeze(1)) # (B, D)
+        pred_proj_next = self.wm.predictor_net(proj_t, act_emb) # \hat{h}_{t+1}
         
-        inputs = full_seq[:, :-1] 
-        targets = full_seq[:, 1:] 
+        # 3. Losses
         
-        logits, _, (_, done_pred) = self.world_model(inputs)
+        # Prediction Loss (Latent Space)
+        # Prevent collapse? SIGReg handles regularization.
+        # Minimal example: 
+        # loss = sigreg(proj) * lamb + inv_loss * (1-lamb)
+        # Here we have dynamics prediction.
         
-        # 1. Pixel/Token Loss (Dynamics) + Reward Token Loss
-        loss_tokens = F.cross_entropy(logits.reshape(-1, TOTAL_VOCAB_SIZE), targets.reshape(-1))
+        # Invariance Loss (MSE between prediction and target)
+        # Note: In standard JEPA, we might stop gradient on target, but LeJEPA paper says "no stop-gradients"
+        loss_pred = F.mse_loss(pred_proj_next, proj_next) # | \hat{h}_{t+1} - h_{t+1} |^2
         
-        # 2. Done Loss (Objective)
-        # We predict Done based on the state after Action is taken.
-        # Action is at index 256.
-        pred_idx = PIXELS # Index of action token
+        # Regularization on projected states (to prevent collapse to 0)
+        # Apply SIGReg to both h_t and h_{t+1}? Or just h_t?
+        # Minimal example applies it to `proj` (output of encoder).
+        loss_sigreg = self.sigreg(proj_t) + self.sigreg(proj_next)
         
-        target_done = done_b.float() # (B, 1)
+        # Total Loss
+        # Reverting to the simple weighted sum from MINIMAL.md
+        # lejepa_loss = sigreg_loss * lamb + inv_loss * (1 - lamb)
+        # Here pred_loss is our "invariance" or performance goal.
         
-        loss_done = F.binary_cross_entropy_with_logits(done_pred[:, pred_idx, :], target_done)
+        loss_sig = self.sigreg(proj_t) + self.sigreg(proj_next)
+        lamb = 0.02 # Starting with paper recommended value
         
-        total_loss = loss_tokens + 5.0 * loss_done
+        total_loss = (1 - lamb) * loss_pred + lamb * loss_sig
         
         self.wm_optim.zero_grad()
         total_loss.backward()
         self.wm_optim.step()
         
         return {
-            "loss_wm": loss_tokens.item(),
-            "loss_done": loss_done.item(),
-            "pred_logits": logits.detach()
+            "loss_wm": loss_pred.item(),
+            "loss_sigreg": loss_sig.item(),
+            "rep/std": proj_t.std(dim=0).mean().item(),
+            "rep/avg_norm": proj_t.norm(p=2, dim=1).mean().item(),
+            "rep/pairwise_dist": F.pdist(proj_t).mean().item() if proj_t.size(0) > 1 else 0.0
         }
 
     def update_ac(self, rollouts):
@@ -229,69 +218,139 @@ class MBRLAgent:
         return {"loss_ac": loss.item(), "val_est": new_values.mean().item()}
 
 def train():
+    print(f"Using device: {DEVICE}")
     wandb.init(project="EnhancedTRM")
     
     env = gym.make('ALE/Breakout-v5', render_mode='rgb_array')
     agent = MBRLAgent()
     
-    replay_buffer = deque(maxlen=2000)
+    replay_buffer = deque(maxlen=5000) # Increased capacity
     
     print("Pre-filling buffer...")
     obs, _ = env.reset()
-    curr_seq = preprocess(obs) 
     
-    for i in range(50):
+    # Initialize frame stack
+    frame_stack_deque = deque([preprocess(obs) for _ in range(FRAME_STACK)], maxlen=FRAME_STACK)
+    curr_stacked_obs = stack_frames(frame_stack_deque)
+    
+    for i in range(100):
         action = env.action_space.sample()
         next_obs, reward, term, trunc, _ = env.step(action)
         done = term or trunc
         
-        next_seq = preprocess(next_obs)
-        replay_buffer.append((curr_seq, action, reward, next_seq, done))
+        # New frame
+        next_frame = preprocess(next_obs)
+        frame_stack_deque.append(next_frame)
+        next_stacked_obs = stack_frames(frame_stack_deque)
         
-        curr_seq = next_seq
+        replay_buffer.append((curr_stacked_obs, action, reward, next_stacked_obs, done))
+        
+        curr_stacked_obs = next_stacked_obs
         if done:
             obs, _ = env.reset()
-            curr_seq = preprocess(obs)
+            frame_stack_deque = deque([preprocess(obs) for _ in range(FRAME_STACK)], maxlen=FRAME_STACK)
+            curr_stacked_obs = stack_frames(frame_stack_deque)
             
     print("Starting Training...")
-    bs = 8
-    
+    bs = 32
     
     rollout_len = 128
     states_buf, actions_buf, rewards_buf, values_buf, log_probs_buf = [], [], [], [], []
 
-    for step in range(10000):
+    # Trackers
+    episode_reward = 0
+    episode_steps = 0
+    episode_count = 0
+    frames = [] # To store frames for video logging
+    action_counts = {i: 0 for i in range(NUM_ACTIONS)}
+
+    for step in range(50000): # Increased steps
         # 1. Interact
-        action, log_prob, value, state = agent.get_action(curr_seq.to(DEVICE))
+        action, log_prob, value, state = agent.get_action(curr_stacked_obs.to(DEVICE))
         
         act_val = action.item()
+        action_counts[act_val] += 1
         next_obs, reward, term, trunc, info = env.step(act_val)
         done = term or trunc
         
-        # Store for AC update
-        states_buf.append(state) # (1, 256)
-        actions_buf.append(action) # (1,)
-        rewards_buf.append(torch.tensor([reward], device=DEVICE))
-        values_buf.append(value) # (1, 1)
-        log_probs_buf.append(log_prob) # (1,)
+        episode_reward += reward
+        episode_steps += 1
         
-        next_seq = preprocess(next_obs)
-        replay_buffer.append((curr_seq, act_val, reward, next_seq, done))
-        curr_seq = next_seq
+        # New frame and stack
+        next_frame = preprocess(next_obs)
+        frame_stack_deque.append(next_frame)
+        next_stacked_obs = stack_frames(frame_stack_deque)
+        
+        # Goal-Conditioned Logic
+        if reward > 0.1: # Hit a block
+            if len(agent.goal_memory) < agent.max_goals:
+                agent.goal_memory.append(state.detach().squeeze(0)) # (D,)
+            else:
+                 agent.goal_memory.pop(0)
+                 agent.goal_memory.append(state.detach().squeeze(0))
+        
+        # Intrinsic Reward
+        with torch.no_grad():
+             _, next_state_emb = agent.wm.encoder(next_stacked_obs.to(DEVICE))
+        
+        intrinsic_reward = agent.get_intrinsic_reward(next_state_emb)
+        alpha = 0.5 
+        total_reward = reward + alpha * intrinsic_reward
+        
+        # Visualization
+        if episode_count % 10 == 0 and len(frames) < 300:
+            small_frame = Image.fromarray(next_obs).resize((160, 210))
+            frames.append(np.array(small_frame).transpose(2, 0, 1))
+        
+        # Store for AC update
+        states_buf.append(state)
+        actions_buf.append(action)
+        rewards_buf.append(torch.tensor([total_reward], device=DEVICE))
+        values_buf.append(value)
+        log_probs_buf.append(log_prob)
+        
+        replay_buffer.append((curr_stacked_obs, act_val, reward, next_stacked_obs, done))
+        curr_stacked_obs = next_stacked_obs
         
         if done:
-            obs, _ = env.reset()
-            curr_seq = preprocess(obs)
+            # Log episode metrics
+            log_dict = {
+                "env/episode_reward": episode_reward,
+                "env/episode_steps": episode_steps,
+                "env/episode_count": episode_count,
+                "env/max_intrinsic": intrinsic_reward,
+                "env/goals_stored": len(agent.goal_memory)
+            }
             
-        # 2. Update AC periodically (Direct Learning)
+            if frames:
+                video_array = np.stack(frames)
+                log_dict["env/gameplay"] = wandb.Video(video_array, fps=30, format="gif")
+                frames = []
+            
+            for a in range(NUM_ACTIONS):
+                log_dict[f"actions/act_{a}"] = action_counts[a]
+                action_counts[a] = 0
+                
+            wandb.log(log_dict)
+            
+            print(f"Episode {episode_count} finished. Reward: {episode_reward}, Steps: {episode_steps}")
+            
+            episode_reward = 0
+            episode_steps = 0
+            episode_count += 1
+            
+            obs, _ = env.reset()
+            frame_stack_deque = deque([preprocess(obs) for _ in range(FRAME_STACK)], maxlen=FRAME_STACK)
+            curr_stacked_obs = stack_frames(frame_stack_deque)
+            
+        # 2. Update AC periodically
         if len(states_buf) >= rollout_len:
             rollouts = (states_buf, actions_buf, rewards_buf, values_buf, log_probs_buf)
             ac_metrics = agent.update_ac(rollouts)
             wandb.log(ac_metrics)
-            # Clear buffers
             states_buf, actions_buf, rewards_buf, values_buf, log_probs_buf = [], [], [], [], []
 
-        # 3. Update World Model (Representation Learning)
+        # 3. Update World Model
         if len(replay_buffer) > bs:
             batch = random.sample(replay_buffer, bs)
             
@@ -302,18 +361,6 @@ def train():
             b_done = torch.tensor([b[4] for b in batch], dtype=torch.float, device=DEVICE).unsqueeze(1)
             
             wm_metrics = agent.train_world_model((b_obs, b_act, b_rew, b_next, b_done))
-            
-            if step % 500 == 0:
-                # Use the new imagine function to see how it performs without teacher forcing
-                pred_obs, pred_rew = agent.imagine(b_obs[0:1], b_act[0].item())
-                
-                pred_pixels = pred_obs[0].cpu().numpy().astype(np.uint8).reshape(IMG_SIZE, IMG_SIZE)
-                target_pixels = b_next[0].cpu().numpy().astype(np.uint8).reshape(IMG_SIZE, IMG_SIZE)
-                
-                vis_img = np.hstack([target_pixels, pred_pixels])
-                wm_metrics["reconstruction"] = wandb.Image(vis_img, caption=f"Actual vs Predicted (Rew: {pred_rew.item()})")
-                
-            del wm_metrics["pred_logits"]
             wandb.log(wm_metrics)
             
         if step % 100 == 0:
@@ -322,17 +369,20 @@ def train():
     env.close()
 
 def test():
+    print(f"Using device: {DEVICE}")
     print("Testing MBRLAgent (Verification)...")
     agent = MBRLAgent()
     
     # 1. Test Forward Pass
     print("1. Testing World Model Forward Pass...")
-    dummy_obs = torch.randint(0, 255, (2, PIXELS)).to(DEVICE)
+    dummy_obs = torch.rand((2, FRAME_STACK, 128, 128)).to(DEVICE) # Float
     dummy_act = torch.zeros((2, 1), dtype=torch.long).to(DEVICE)
-    dummy_next = torch.randint(0, 255, (2, PIXELS)).to(DEVICE)
+    dummy_next = torch.rand((2, FRAME_STACK, 128, 128)).to(DEVICE)
     
-    dummy_rew = torch.zeros((2, 1), dtype=torch.float).to(DEVICE)
-    dummy_done = torch.zeros((2, 1), dtype=torch.float).to(DEVICE)
+    # Updated batch for Goal-Conditioned (no rew/done needed in WM update, but function signature expects them unpacked)
+    # train_world_model unpacks 5 items. We pass dummies.
+    dummy_rew = torch.zeros((2, 1)).to(DEVICE)
+    dummy_done = torch.zeros((2, 1)).to(DEVICE)
     
     batch = (dummy_obs, dummy_act, dummy_rew, dummy_next, dummy_done)
     metrics = agent.train_world_model(batch)
@@ -340,7 +390,7 @@ def test():
     
     # 3. Test Action
     print("3. Testing Actor...")
-    action, log_prob, value, state = agent.get_action(dummy_obs)
+    action, log_prob, value, state = agent.get_action(dummy_obs[0:1])
     print(f"Action selected: {action}")
     
     print("Test Passed!")
@@ -352,4 +402,3 @@ if __name__ == "__main__":
         test()
     else:
         test()
-        # train() # Uncomment to run training after test manually

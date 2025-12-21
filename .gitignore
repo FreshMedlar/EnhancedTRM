@@ -4,6 +4,7 @@ model/wandb/
 *.pth
 model/*.pth
 model/mdlARC/
+model/jepa/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
