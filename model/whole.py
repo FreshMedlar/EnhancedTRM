@@ -45,8 +45,6 @@ class MBRLAgent:
         
         self.wm = JEPAWorldModel(LATENT_DIM, NUM_ACTIONS, in_channels=FRAME_STACK).to(device)
         self.sigreg = SIGReg().to(device)
-        self.goal_memory = [] # Store latent embeddings of successful states
-        self.max_goals = 1000
         
         self.actor = Actor(LATENT_DIM, NUM_ACTIONS).to(device)
         self.critic = Critic(LATENT_DIM).to(device)
@@ -78,29 +76,6 @@ class MBRLAgent:
                 
         return action, log_prob, value, state
 
-    def get_intrinsic_reward(self, state):
-        """
-        Calculate max cosine similarity between state and goal memory.
-        state: (1, LATENT_DIM)
-        """
-        if not self.goal_memory:
-            return 0.0
-        
-        # Stack goals: (N, LATENT_DIM)
-        # Check if we have enough goals to batch?
-        # Ideally keep goals as a tensor buffer
-        goals = torch.stack(self.goal_memory) # (N, D)
-        
-        # Normalize state and goals
-        state_norm = F.normalize(state, p=2, dim=1)
-        goals_norm = F.normalize(goals, p=2, dim=1)
-        
-        # Similarity: (1, D) @ (D, N) -> (1, N)
-        sim_scores = torch.mm(state_norm, goals_norm.t())
-        
-        max_sim = sim_scores.max().item()
-        return max_sim
-
     def train_world_model(self, batch):
         obs_b, act_b, rew_b, next_obs_b, done_b = batch
         # obs_b: (B, 3, 128, 128)
@@ -115,30 +90,19 @@ class MBRLAgent:
         
         # 3. Losses
         
-        # Prediction Loss (Latent Space)
-        # Prevent collapse? SIGReg handles regularization.
-        # Minimal example: 
-        # loss = sigreg(proj) * lamb + inv_loss * (1-lamb)
-        # Here we have dynamics prediction.
-        
         # Invariance Loss (MSE between prediction and target)
-        # Note: In standard JEPA, we might stop gradient on target, but LeJEPA paper says "no stop-gradients"
         loss_pred = F.mse_loss(pred_proj_next, proj_next) # | \hat{h}_{t+1} - h_{t+1} |^2
         
-        # Regularization on projected states (to prevent collapse to 0)
-        # Apply SIGReg to both h_t and h_{t+1}? Or just h_t?
-        # Minimal example applies it to `proj` (output of encoder).
-        loss_sigreg = self.sigreg(proj_t) + self.sigreg(proj_next)
-        
         # Total Loss
-        # Reverting to the simple weighted sum from MINIMAL.md
         # lejepa_loss = sigreg_loss * lamb + inv_loss * (1 - lamb)
-        # Here pred_loss is our "invariance" or performance goal.
+        # Reward Prediction
+        pred_reward = self.wm.reward_predictor(proj_t, act_emb)
+        loss_reward = F.mse_loss(pred_reward, rew_b)
+
+        loss_sig = self.sigreg(proj_t) # + self.sigreg(pred_proj_next)
+        lamb = 0.02 
         
-        loss_sig = self.sigreg(proj_t) + self.sigreg(proj_next)
-        lamb = 0.02 # Starting with paper recommended value
-        
-        total_loss = (1 - lamb) * loss_pred + lamb * loss_sig
+        total_loss = (1 - lamb) * loss_pred + lamb * loss_sig + loss_reward
         
         self.wm_optim.zero_grad()
         total_loss.backward()
@@ -146,6 +110,7 @@ class MBRLAgent:
         
         return {
             "loss_wm": loss_pred.item(),
+            "loss_reward": loss_reward.item(),
             "loss_sigreg": loss_sig.item(),
             "rep/std": proj_t.std(dim=0).mean().item(),
             "rep/avg_norm": proj_t.norm(p=2, dim=1).mean().item(),
@@ -281,31 +246,10 @@ def train():
         frame_stack_deque.append(next_frame)
         next_stacked_obs = stack_frames(frame_stack_deque)
         
-        # Goal-Conditioned Logic
-        if reward > 0.1: # Hit a block
-            if len(agent.goal_memory) < agent.max_goals:
-                agent.goal_memory.append(state.detach().squeeze(0)) # (D,)
-            else:
-                 agent.goal_memory.pop(0)
-                 agent.goal_memory.append(state.detach().squeeze(0))
-        
-        # Intrinsic Reward
-        with torch.no_grad():
-             _, next_state_emb = agent.wm.encoder(next_stacked_obs.to(DEVICE))
-        
-        intrinsic_reward = agent.get_intrinsic_reward(next_state_emb)
-        alpha = 0.5 
-        total_reward = reward + alpha * intrinsic_reward
-        
-        # Visualization
-        if episode_count % 10 == 0 and len(frames) < 300:
-            small_frame = Image.fromarray(next_obs).resize((160, 210))
-            frames.append(np.array(small_frame).transpose(2, 0, 1))
-        
         # Store for AC update
         states_buf.append(state)
         actions_buf.append(action)
-        rewards_buf.append(torch.tensor([total_reward], device=DEVICE))
+        rewards_buf.append(torch.tensor([reward], device=DEVICE))
         values_buf.append(value)
         log_probs_buf.append(log_prob)
         
@@ -318,8 +262,6 @@ def train():
                 "env/episode_reward": episode_reward,
                 "env/episode_steps": episode_steps,
                 "env/episode_count": episode_count,
-                "env/max_intrinsic": intrinsic_reward,
-                "env/goals_stored": len(agent.goal_memory)
             }
             
             if frames:

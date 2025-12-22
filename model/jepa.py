@@ -70,23 +70,28 @@ class Predictor(nn.Module):
         x = torch.cat([state, action_embed], dim=-1)
         return self.net(x)
 
+class RewardPredictor(nn.Module):
+    def __init__(self, input_dim, action_dim, hidden_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim + action_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1) # Scalar reward output
+        )
+        
+    def forward(self, state, action_embed):
+        x = torch.cat([state, action_embed], dim=-1)
+        return self.net(x)
+
 class JEPAWorldModel(nn.Module):
     def __init__(self, latent_dim, num_actions, in_channels=3):
         super().__init__()
         self.encoder = ResNetEncoder(proj_dim=latent_dim, in_channels=in_channels)
         self.act_embedding = nn.Embedding(num_actions, latent_dim)
         self.predictor_net = Predictor(latent_dim, latent_dim)
+        self.reward_predictor = RewardPredictor(latent_dim, latent_dim)
     
     def forward(self, x):
         emb, proj = self.encoder(x)
         return proj
-    def __init__(self, latent_dim, num_actions, in_channels=3):
-        super().__init__()
-        self.encoder = ResNetEncoder(proj_dim=latent_dim, in_channels=in_channels)
-        self.act_embedding = nn.Embedding(num_actions, latent_dim)
-        self.predictor_net = Predictor(latent_dim, latent_dim) 
-    
-    def forward(self, x):
-        emb, proj = self.encoder(x)
-        return proj
-
