@@ -300,16 +300,17 @@ class RWKVWorldModel(nn.Module):
             print(f"Failed to load RWKV CUDA kernel: {e}. Using pure python implementation.")
             WKVKernel = None
 
-    def forward(self, idx, inputs_embeds=None, past_kvs=None):
+    def forward(self, idx, inputs_embeds=None, state=None):
         if inputs_embeds is not None:
              x = inputs_embeds
         else:
              x = self.rwkv.wte(idx)
         
         x = self.rwkv.ln_p(x)
-        state = None
+        # state must be passed
         for block in self.rwkv.h:
             x, state = block(x, state)
+            
         x = self.rwkv.ln_f(x)
         logits = self.lm_head(x)
         
@@ -317,4 +318,4 @@ class RWKVWorldModel(nn.Module):
         reward_pred = self.reward_head(x)
         done_pred = self.done_head(x)
         
-        return logits, x, (reward_pred, done_pred)
+        return logits, x, (reward_pred, done_pred), state
