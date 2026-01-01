@@ -1,5 +1,6 @@
 import gymnasium as gym
 import ale_py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,6 +15,9 @@ import math
 import sys
 import os
 from dataclasses import dataclass
+
+from networks import Actor, Critic
+from jepa import JEPAWorldModel, SIGReg
 
 # Constants
 IMG_SIZE = 84
@@ -39,9 +43,6 @@ def preprocess(obs):
 def stack_frames(frames_deque):
     # Just return the latest frame if stack is 1
     return frames_deque[-1].unsqueeze(0) # (1, 1, 84, 84)
-
-from networks import Actor, Critic
-from jepa import JEPAWorldModel, SIGReg
 
 class CuriosityEnsemble(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=256, num_models=5):
