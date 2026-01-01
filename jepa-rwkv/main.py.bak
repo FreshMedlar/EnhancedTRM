@@ -1,0 +1,365 @@
+import os
+print("DEBUG: Script started", flush=True)
+import sys
+import math
+import random
+import copy
+import warnings
+from dataclasses import dataclass
+from collections import deque
+
+import torch
+import torch.nn as nn
+print("DEBUG: torch imported", flush=True)
+print("DEBUG: Importing F", flush=True)
+import torch.nn.functional as F
+print("DEBUG: Importing AdamW", flush=True)
+from torch.optim import AdamW
+print("DEBUG: Importing MLP", flush=True)
+from torchvision.ops import MLP
+print("DEBUG: Importing numpy", flush=True)
+import numpy as np
+print("DEBUG: Importing PIL", flush=True)
+from PIL import Image
+print("DEBUG: Importing gym", flush=True)
+import gymnasium as gym
+print("DEBUG: Importing ale_py", flush=True)
+import ale_py
+print("DEBUG: Importing wandb", flush=True)
+import wandb
+print("DEBUG: Importing tqdm", flush=True)
+import tqdm
+print("DEBUG: standard imports done", flush=True)
+
+# Add base_models to sys.path to ensure imports work
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+print(f"DEBUG: sys.path: {sys.path}", flush=True)
+from base_models.rwkv import Block, LayerNorm
+print("DEBUG: base_models.rwkv imported", flush=True)
+from base_models.lejepa import SIGReg, ViTEncoder
+print("DEBUG: base_models.lejepa imported", flush=True)
+
+# --- Constants & Config ---
+IMG_SIZE = 128
+CHANNELS = 3
+NUM_ACTIONS = 6 # Breakout-v5 has 6 actions (NOOP, FIRE, RIGHT, LEFT, RIGHTFIRE, LEFTFIRE)
+LATENT_DIM = 128
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+SEQ_LEN = 8
+BATCH_SIZE = 8
+TRAIN_FREQ = 50
+TRAIN_STEPS = 5
+EMA_TAU = 0.99
+GAMMA = 0.99
+LAMBDA = 0.95
+
+@dataclass
+class RWKVConfig:
+    n_embd: int = 128
+    n_layer: int = 4
+    n_head: int = 4
+    bias: bool = True
+    dropout: float = 0.0
+
+# --- World Model & Predictor ---
+
+class RWKVPredictor(nn.Module):
+    def __init__(self, proj_dim, n_layer=4, n_head=4):
+        super().__init__()
+        self.config = RWKVConfig(n_embd=proj_dim, n_layer=n_layer, n_head=n_head)
+        self.blocks = nn.ModuleList([Block(self.config, i) for i in range(n_layer)])
+        self.ln_out = LayerNorm(proj_dim, bias=True)
+
+    def forward(self, z, actions):
+        # z: (N, V, D)
+        # actions: (N, V, D) - action embeddings
+        x = z + actions
+        for block in self.blocks:
+            x = block(x)
+        return self.ln_out(x)
+
+class JEPAWorldModel(nn.Module):
+    def __init__(self, proj_dim=128):
+        super().__init__()
+        self.encoder = ViTEncoder(proj_dim)
+        self.target_encoder = copy.deepcopy(self.encoder)
+        for p in self.target_encoder.parameters():
+            p.requires_grad = False
+            
+        self.predictor = RWKVPredictor(proj_dim)
+        self.action_emb = nn.Embedding(NUM_ACTIONS, proj_dim)
+        self.reward_predictor = nn.Linear(proj_dim, 1)
+        
+    def encode(self, obs, target=False):
+        if target:
+            with torch.no_grad():
+                _, proj_emb = self.target_encoder(obs)
+                # target_encoder returns (V, N, D) based on lejepa.py transpose(0, 1)
+                # We want (N, V, D)
+                return proj_emb.transpose(0, 1)
+        _, proj_emb = self.encoder(obs)
+        return proj_emb.transpose(0, 1)
+
+    def predict(self, z, actions):
+        act_emb = self.action_emb(actions)
+        return self.predictor(z, act_emb)
+
+# --- Actor-Critic ---
+
+class Actor(nn.Module):
+    def __init__(self, latent_dim, num_actions):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, num_actions)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class Critic(nn.Module):
+    def __init__(self, latent_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+# --- Environment Hub ---
+
+def preprocess(obs):
+    # obs: (210, 160, 3)
+    img = Image.fromarray(obs)
+    img = img.resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
+    arr = np.array(img).astype(np.float32) / 255.0
+    # (C, H, W)
+    return torch.tensor(arr, dtype=torch.float32).permute(2, 0, 1)
+
+class MBRLAgent:
+    def __init__(self, device=DEVICE):
+        self.device = device
+        self.wm = JEPAWorldModel(LATENT_DIM).to(device)
+        self.sigreg = SIGReg().to(device)
+        self.actor = Actor(LATENT_DIM, NUM_ACTIONS).to(device)
+        self.critic = Critic(LATENT_DIM).to(device)
+        
+        self.wm_optim = AdamW(self.wm.parameters(), lr=1e-4)
+        self.ac_optim = AdamW(list(self.actor.parameters()) + list(self.critic.parameters()), lr=1e-4)
+        
+    def update_ema(self, tau=EMA_TAU):
+        with torch.no_grad():
+            for target_param, source_param in zip(self.wm.target_encoder.parameters(), self.wm.encoder.parameters()):
+                target_param.data.copy_(target_param.data * tau + source_param.data * (1.0 - tau))
+
+    @torch.no_grad()
+    def get_action(self, obs, deterministic=False):
+        # obs: (C, H, W) -> (1, 1, C, H, W)
+        obs_seq = obs.unsqueeze(0).unsqueeze(0).to(self.device)
+        z_seq = self.wm.encode(obs_seq)
+        z = z_seq.squeeze(0).squeeze(0) # (D)
+        
+        logits = self.actor(z)
+        dist = torch.distributions.Categorical(logits=logits)
+        if deterministic:
+            action = torch.argmax(logits, dim=-1)
+        else:
+            action = dist.sample()
+        
+        return action, dist.log_prob(action), self.critic(z).squeeze(-1)
+
+    def train_world_model(self, batch):
+        obs_b, act_b, rew_b, next_obs_b, done_b = batch
+        # obs_b: (B, T, C, H, W)
+        B, T, _, _, _ = obs_b.shape
+        
+        # 1. Encode
+        z = self.wm.encode(obs_b) # (B, T, D)
+        with torch.no_grad():
+            z_next_target = self.wm.encode(next_obs_b, target=True) # (B, T, D)
+            
+        # 2. Predict
+        z_next_pred = self.wm.predict(z, act_b.squeeze(-1)) # (B, T, D)
+        
+        # 3. Reward Prediction
+        rew_pred = self.wm.reward_predictor(z) # (B, T, 1)
+        
+        # 4. Losses
+        loss_pred = F.mse_loss(z_next_pred, z_next_target)
+        loss_reward = F.mse_loss(rew_pred, rew_b)
+        
+        # SIGReg (on student latents)
+        loss_sig = self.sigreg(z.reshape(B*T, -1))
+        
+        total_loss = loss_pred + loss_reward + 0.02 * loss_sig
+        
+        self.wm_optim.zero_grad()
+        total_loss.backward()
+        self.wm_optim.step()
+        self.update_ema()
+        
+        return {
+            "wm/loss_total": total_loss.item(),
+            "wm/loss_pred": loss_pred.item(),
+            "wm/loss_reward": loss_reward.item(),
+            "wm/loss_sig": loss_sig.item(),
+        }
+
+    def update_ac(self, rollouts):
+        states, actions, rewards, values, log_probs, dones = rollouts
+        T = len(rewards)
+        B = rewards[0].size(0)
+        
+        rewards = torch.stack(rewards).view(T, B)
+        values = torch.stack(values).view(T, B)
+        log_probs = torch.stack(log_probs).view(T, B)
+        dones = torch.stack(dones).view(T, B)
+        
+        advantages = torch.zeros_like(rewards)
+        last_gae = 0
+        for t in reversed(range(T)):
+            mask = 1.0 - dones[t]
+            next_val = values[t+1] if t < T - 1 else 0
+            delta = rewards[t] + GAMMA * next_val * mask - values[t]
+            last_gae = delta + GAMMA * LAMBDA * mask * last_gae
+            advantages[t] = last_gae
+            
+        returns = advantages + values
+        
+        b_states = torch.stack(states).view(T*B, -1)
+        b_actions = torch.stack(actions).view(T*B)
+        b_log_probs = log_probs.view(T*B)
+        b_returns = returns.view(T*B)
+        b_advantages = (advantages.view(T*B) - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        for _ in range(3):
+            logits = self.actor(b_states)
+            dist = torch.distributions.Categorical(logits=logits)
+            new_log_probs = dist.log_prob(b_actions)
+            new_values = self.critic(b_states).squeeze(-1)
+            
+            ratio = (new_log_probs - b_log_probs).exp()
+            surr1 = ratio * b_advantages
+            surr2 = torch.clamp(ratio, 0.8, 1.2) * b_advantages
+            
+            actor_loss = -torch.min(surr1, surr2).mean() - 0.01 * dist.entropy().mean()
+            critic_loss = F.mse_loss(new_values, b_returns)
+            
+            loss = actor_loss + 0.5 * critic_loss
+            
+            self.ac_optim.zero_grad()
+            loss.backward()
+            self.ac_optim.step()
+            
+        return {"ac/loss": loss.item(), "ac/val": values.mean().item()}
+
+def main():
+    print(f"Starting JEPA-RWKV Training on {DEVICE}")
+    wandb.init(project="jepa-rwkv", name="vit-rwkv-breakout")
+    
+    env = gym.make('ALE/Breakout-v5', render_mode='rgb_array')
+    agent = MBRLAgent()
+    
+    replay_buffer = []
+    current_episode = []
+    
+    obs, _ = env.reset()
+    curr_frame = preprocess(obs)
+    
+    episode_reward = 0
+    episode_steps = 0
+    episode_count = 0
+    
+    states_buf, actions_buf, rewards_buf, values_buf, log_probs_buf, dones_buf = [], [], [], [], [], []
+    
+    pbar = tqdm.tqdm(range(50000))
+    for step in pbar:
+        # 1. Action
+        action, log_prob, val = agent.get_action(curr_frame)
+        act_val = action.item()
+        
+        next_obs, reward, term, trunc, _ = env.step(act_val)
+        done = term or trunc
+        next_frame = preprocess(next_obs)
+        
+        # Store for RL
+        with torch.no_grad():
+            z = agent.wm.encode(curr_frame.unsqueeze(0).unsqueeze(0).to(DEVICE)).squeeze(0).squeeze(0)
+            
+        states_buf.append(z)
+        actions_buf.append(action)
+        rewards_buf.append(torch.tensor([reward], device=DEVICE))
+        values_buf.append(val)
+        log_probs_buf.append(log_prob)
+        dones_buf.append(torch.tensor([done], device=DEVICE))
+        
+        # Store for WM
+        current_episode.append((curr_frame, act_val, reward, next_frame, done))
+        
+        curr_frame = next_frame
+        episode_reward += reward
+        episode_steps += 1
+        
+        if done:
+            replay_buffer.append(current_episode)
+            if len(replay_buffer) > 100: replay_buffer.pop(0)
+            current_episode = []
+            
+            wandb.log({
+                "env/reward": episode_reward,
+                "env/steps": episode_steps,
+                "env/episode": episode_count
+            }, step=step)
+            
+            pbar.set_description(f"Ep {episode_count} Rew {episode_reward}")
+            
+            episode_reward = 0
+            episode_steps = 0
+            episode_count += 1
+            obs, _ = env.reset()
+            curr_frame = preprocess(obs)
+            
+        # 2. Train AC
+        if len(states_buf) >= 128:
+            ac_metrics = agent.update_ac((states_buf, actions_buf, rewards_buf, values_buf, log_probs_buf, dones_buf))
+            wandb.log(ac_metrics, step=step)
+            states_buf, actions_buf, rewards_buf, values_buf, log_probs_buf, dones_buf = [], [], [], [], [], []
+            
+        # 3. Train WM
+        if step % TRAIN_FREQ == 0 and len(replay_buffer) > 2:
+            wm_metrics_accum = {}
+            for _ in range(TRAIN_STEPS):
+                b_obs, b_act, b_rew, b_next, b_done = [], [], [], [], []
+                for _ in range(BATCH_SIZE):
+                    ep = random.choice(replay_buffer)
+                    if len(ep) < SEQ_LEN:
+                        seq = ep + [ep[-1]] * (SEQ_LEN - len(ep))
+                    else:
+                        start = random.randint(0, len(ep) - SEQ_LEN)
+                        seq = ep[start:start+SEQ_LEN]
+                    
+                    b_obs.append(torch.stack([s[0] for s in seq]))
+                    b_act.append(torch.tensor([s[1] for s in seq], dtype=torch.long).unsqueeze(-1))
+                    b_rew.append(torch.tensor([s[2] for s in seq], dtype=torch.float32).unsqueeze(-1))
+                    b_next.append(torch.stack([s[3] for s in seq]))
+                    b_done.append(torch.tensor([s[4] for s in seq], dtype=torch.float32).unsqueeze(-1))
+                
+                batch = (
+                    torch.stack(b_obs).to(DEVICE),
+                    torch.stack(b_act).to(DEVICE),
+                    torch.stack(b_rew).to(DEVICE),
+                    torch.stack(b_next).to(DEVICE),
+                    torch.stack(b_done).to(DEVICE)
+                )
+                metrics = agent.train_world_model(batch)
+                for k, v in metrics.items():
+                    wm_metrics_accum[k] = wm_metrics_accum.get(k, 0) + v / TRAIN_STEPS
+            
+            wandb.log(wm_metrics_accum, step=step)
+
+    env.close()
+
+if __name__ == "__main__":
+    main()
