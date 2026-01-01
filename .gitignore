@@ -5,6 +5,7 @@ model/wandb/
 model/*.pth
 model/mdlARC/
 model/jepa/
+topas_DSLPv1/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
